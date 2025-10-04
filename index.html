@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Urban Traffic Analyzer</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
     <style>
         * {
             margin: 0;
@@ -41,6 +42,15 @@
             font-size: 18px;
         }
         
+        .instructions {
+            padding: 10px;
+            background: #E3F2FD;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 13px;
+            color: #1976D2;
+        }
+        
         .btn {
             width: 100%;
             padding: 10px;
@@ -61,6 +71,14 @@
         .btn:disabled {
             background: #ccc;
             cursor: not-allowed;
+        }
+        
+        .btn-clear {
+            background: #f44336;
+        }
+        
+        .btn-clear:hover {
+            background: #da190b;
         }
         
         .status {
@@ -105,6 +123,18 @@
         .street-popup strong {
             color: #333;
         }
+        
+        .stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #E8F5E9;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        
+        .stats div {
+            margin: 3px 0;
+        }
     </style>
 </head>
 <body>
@@ -112,8 +142,21 @@
     
     <div class="control-panel">
         <h3>🚦 Traffic Analyzer</h3>
-        <button id="loadStreetsBtn" class="btn">Load Street Network</button>
-        <div id="status" class="status">Ready to load street data</div>
+        
+        <div class="instructions">
+            📍 Draw a polygon on the map to select an area, then click "Load Streets"
+        </div>
+        
+        <button id="loadStreetsBtn" class="btn" disabled>Load Street Network</button>
+        <button id="clearBtn" class="btn btn-clear">Clear All</button>
+        
+        <div id="status" class="status">Draw a polygon to get started</div>
+        
+        <div id="stats" class="stats" style="display: none;">
+            <strong>Network Stats:</strong>
+            <div id="nodeCount">Nodes: 0</div>
+            <div id="edgeCount">Streets: 0</div>
+        </div>
         
         <div class="legend">
             <strong>Road Types:</strong>
@@ -141,6 +184,7 @@
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script src="https://unpkg.com/graphology/dist/graphology.umd.js"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
     
@@ -151,6 +195,8 @@
                 this.graph = new graphology.Graph();
                 this.streetLayers = {};
                 this.osmData = null;
+                this.drawnItems = null;
+                this.selectedPolygon = null;
                 
                 // Default city: Bordeaux, France
                 this.defaultCenter = [44.8378, -0.5792];
@@ -159,8 +205,9 @@
             
             async initialize() {
                 this.setupMap();
+                this.setupDrawControls();
                 this.setupEventHandlers();
-                this.updateStatus('Map ready. Click "Load Street Network" to begin.');
+                this.updateStatus('Draw a polygon on the map to select an area');
             }
             
             setupMap() {
@@ -176,32 +223,112 @@
                 console.log('Map initialized');
             }
             
+            setupDrawControls() {
+                // Layer for drawn items
+                this.drawnItems = new L.FeatureGroup();
+                this.map.addLayer(this.drawnItems);
+                
+                // Draw control
+                const drawControl = new L.Control.Draw({
+                    draw: {
+                        polygon: {
+                            shapeOptions: {
+                                color: '#2196F3',
+                                fillOpacity: 0.2
+                            }
+                        },
+                        polyline: false,
+                        rectangle: {
+                            shapeOptions: {
+                                color: '#2196F3',
+                                fillOpacity: 0.2
+                            }
+                        },
+                        circle: false,
+                        marker: false,
+                        circlemarker: false
+                    },
+                    edit: {
+                        featureGroup: this.drawnItems,
+                        remove: true
+                    }
+                });
+                this.map.addControl(drawControl);
+                
+                // Event handlers for drawing
+                this.map.on(L.Draw.Event.CREATED, (e) => {
+                    const layer = e.layer;
+                    this.drawnItems.addLayer(layer);
+                    this.selectedPolygon = layer;
+                    
+                    document.getElementById('loadStreetsBtn').disabled = false;
+                    this.updateStatus('Polygon drawn! Click "Load Street Network" to fetch data');
+                });
+                
+                this.map.on(L.Draw.Event.DELETED, (e) => {
+                    this.selectedPolygon = null;
+                    document.getElementById('loadStreetsBtn').disabled = true;
+                    this.updateStatus('Draw a polygon to select an area');
+                });
+            }
+            
             setupEventHandlers() {
                 document.getElementById('loadStreetsBtn').addEventListener('click', () => {
                     this.loadOSMData();
                 });
+                
+                document.getElementById('clearBtn').addEventListener('click', () => {
+                    this.clearAll();
+                });
+            }
+            
+            clearAll() {
+                // Clear drawn items
+                this.drawnItems.clearLayers();
+                this.selectedPolygon = null;
+                
+                // Clear streets
+                Object.values(this.streetLayers).forEach(layer => {
+                    this.map.removeLayer(layer);
+                });
+                this.streetLayers = {};
+                
+                // Clear graph
+                this.graph.clear();
+                
+                // Reset UI
+                document.getElementById('loadStreetsBtn').disabled = true;
+                document.getElementById('stats').style.display = 'none';
+                this.updateStatus('Draw a polygon to select an area');
             }
             
             async loadOSMData() {
+                if (!this.selectedPolygon) {
+                    alert('Please draw a polygon first');
+                    return;
+                }
+                
                 const btn = document.getElementById('loadStreetsBtn');
                 btn.disabled = true;
                 this.updateStatus('Loading street network...', true);
                 
                 try {
-                    // Get current map bounds
-                    const bounds = this.map.getBounds();
-                    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+                    // Get polygon coordinates
+                    const latlngs = this.selectedPolygon.getLatLngs()[0];
+                    const polyCoords = latlngs.map(ll => `${ll.lat} ${ll.lng}`).join(' ');
                     
-                    // Overpass API query for streets
+                    // Overpass API query for streets within polygon
                     const query = `
-                        [out:json][timeout:25];
+                        [out:json][timeout:60];
                         (
-                          way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](${bbox});
+                          way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](poly:"${polyCoords}");
                         );
                         out body;
                         >;
                         out skel qt;
                     `;
+                    
+                    console.log('Sending Overpass query...');
                     
                     const response = await axios.post(
                         'https://overpass-api.de/api/interpreter',
@@ -212,11 +339,22 @@
                     this.osmData = response.data;
                     console.log('OSM data loaded:', this.osmData.elements.length, 'elements');
                     
+                    if (this.osmData.elements.length === 0) {
+                        this.updateStatus('No streets found in this area. Try a larger area.');
+                        btn.disabled = false;
+                        return;
+                    }
+                    
                     // Parse and visualize
                     this.parseOSMIntoGraph();
                     this.visualizeStreets();
                     
-                    this.updateStatus(`Loaded ${Object.keys(this.streetLayers).length} streets`);
+                    // Update stats
+                    document.getElementById('stats').style.display = 'block';
+                    document.getElementById('nodeCount').textContent = `Nodes: ${this.graph.order}`;
+                    document.getElementById('edgeCount').textContent = `Streets: ${Object.keys(this.streetLayers).length}`;
+                    
+                    this.updateStatus(`✅ Loaded ${Object.keys(this.streetLayers).length} street segments`);
                     btn.disabled = false;
                     
                 } catch (error) {
@@ -241,7 +379,10 @@
                     }
                 });
                 
+                console.log('Collected', Object.keys(nodes).length, 'nodes');
+                
                 // Second pass: process ways (streets)
+                let edgeCount = 0;
                 this.osmData.elements.forEach(element => {
                     if (element.type === 'way' && element.tags && element.tags.highway) {
                         const wayId = element.id;
@@ -265,8 +406,10 @@
                             if (nodes[source] && nodes[target]) {
                                 const edgeId = `${wayId}_${i}`;
                                 
-                                if (!this.graph.hasEdge(edgeId)) {
-                                    this.graph.addEdge(source, target, edgeId, {
+                                try {
+                                    // Correct order: source, target, attributes
+                                    this.graph.addEdge(source, target, {
+                                        edgeId: edgeId,
                                         wayId: wayId,
                                         highway: element.tags.highway,
                                         name: element.tags.name || 'Unnamed',
@@ -276,24 +419,28 @@
                                             [nodes[target].lat, nodes[target].lon]
                                         ]
                                     });
+                                    edgeCount++;
+                                } catch (e) {
+                                    // Edge might already exist, skip
                                 }
                             }
                         }
                     }
                 });
                 
-                console.log('Graph built:', this.graph.order, 'nodes,', this.graph.size, 'edges');
+                console.log('Graph built:', this.graph.order, 'nodes,', edgeCount, 'edges');
             }
             
             visualizeStreets() {
-                // Clear existing layers
+                // Clear existing street layers
                 Object.values(this.streetLayers).forEach(layer => {
                     this.map.removeLayer(layer);
                 });
                 this.streetLayers = {};
                 
                 // Draw each edge
-                this.graph.forEachEdge((edge, attributes, source, target) => {
+                let layerCount = 0;
+                this.graph.forEachEdge((edge, attributes) => {
                     const coords = attributes.coordinates;
                     const color = this.getRoadColor(attributes.highway);
                     const weight = this.getRoadWeight(attributes.highway);
@@ -310,13 +457,16 @@
                             <strong>${attributes.name}</strong><br>
                             Type: ${attributes.highway}<br>
                             Max Speed: ${attributes.maxspeed}<br>
-                            Edge ID: ${edge}
+                            Way ID: ${attributes.wayId}
                         </div>
                     `;
                     polyline.bindPopup(popupContent);
                     
-                    this.streetLayers[edge] = polyline;
+                    this.streetLayers[attributes.edgeId] = polyline;
+                    layerCount++;
                 });
+                
+                console.log('Visualized', layerCount, 'street segments');
             }
             
             getRoadColor(highway) {
