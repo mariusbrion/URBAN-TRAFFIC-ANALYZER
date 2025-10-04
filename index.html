@@ -212,7 +212,6 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script src="https://unpkg.com/graphology/dist/graphology.umd.js"></script>
-    <script src="https://unpkg.com/graphology-metrics@2.1.0/dist/graphology-metrics.umd.js"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
     
     <script>
@@ -683,7 +682,6 @@
                     let weight = 1;
                     
                     if (traffic) {
-                        // Weight = travel_time * congestion_factor
                         const speed = traffic.currentSpeed || 50;
                         const congestionFactor = traffic.freeFlowSpeed / Math.max(speed, 1);
                         weight = congestionFactor;
@@ -692,8 +690,8 @@
                     this.graph.setEdgeAttribute(edge, 'weight', weight);
                 });
                 
-                // Calculate betweenness centrality
-                const centrality = graphologyLibrary.betweenness(this.graph, { weighted: true });
+                // Calculate betweenness centrality using simplified algorithm
+                const centrality = this.calculateBetweenness();
                 
                 // Normalize scores 0-100
                 const scores = Object.values(centrality);
@@ -715,6 +713,68 @@
                 this.updateStatus('✅ Importance calculated! Switch to "Street Importance" view');
                 document.getElementById('viewModeSelect').value = 'importance';
                 this.toggleViewMode('importance');
+            }
+            
+            calculateBetweenness() {
+                const betweenness = {};
+                const nodes = this.graph.nodes();
+                
+                // Initialize all nodes to 0
+                nodes.forEach(node => betweenness[node] = 0);
+                
+                // For each node as source
+                nodes.forEach(source => {
+                    const stack = [];
+                    const paths = {};
+                    const dist = {};
+                    const sigma = {};
+                    const delta = {};
+                    
+                    nodes.forEach(node => {
+                        paths[node] = [];
+                        dist[node] = -1;
+                        sigma[node] = 0;
+                        delta[node] = 0;
+                    });
+                    
+                    dist[source] = 0;
+                    sigma[source] = 1;
+                    const queue = [source];
+                    
+                    // BFS
+                    while (queue.length > 0) {
+                        const v = queue.shift();
+                        stack.push(v);
+                        
+                        const neighbors = this.graph.neighbors(v);
+                        neighbors.forEach(w => {
+                            // First time we see this node?
+                            if (dist[w] < 0) {
+                                queue.push(w);
+                                dist[w] = dist[v] + 1;
+                            }
+                            
+                            // Shortest path to w via v?
+                            if (dist[w] === dist[v] + 1) {
+                                sigma[w] += sigma[v];
+                                paths[w].push(v);
+                            }
+                        });
+                    }
+                    
+                    // Accumulation
+                    while (stack.length > 0) {
+                        const w = stack.pop();
+                        paths[w].forEach(v => {
+                            delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w]);
+                        });
+                        if (w !== source) {
+                            betweenness[w] += delta[w];
+                        }
+                    }
+                });
+                
+                return betweenness;
             }
             
             toggleViewMode(mode) {
