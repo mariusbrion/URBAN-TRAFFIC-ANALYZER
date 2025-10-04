@@ -161,6 +161,19 @@
             </select>
         </div>
         
+        <button id="calculateImportanceBtn" class="btn" style="background: #9C27B0; margin-top: 10px;" disabled>Calculate Importance</button>
+        
+        <div style="margin-top: 15px;">
+            <label style="font-size: 13px; color: #666; display: block; margin-bottom: 5px;">
+                <strong>View Mode:</strong>
+            </label>
+            <select id="viewModeSelect" class="btn" style="padding: 8px;" disabled>
+                <option value="roadtype">Road Types</option>
+                <option value="traffic">Traffic Flow</option>
+                <option value="importance">Street Importance</option>
+            </select>
+        </div>
+        
         <button id="clearBtn" class="btn btn-clear">Clear All</button>
         
         <div id="status" class="status">Draw a polygon to get started</div>
@@ -199,6 +212,7 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script src="https://unpkg.com/graphology/dist/graphology.umd.js"></script>
+    <script src="https://unpkg.com/graphology-metrics@2.1.0/centrality/betweenness.js"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
     
     <script>
@@ -211,8 +225,9 @@
                 this.drawnItems = null;
                 this.selectedPolygon = null;
                 this.tomtomApiKey = '2hRMy8jfLxTGLUhZ3UJNoqAlihmLd9PA';
-                this.currentViewMode = 'roadtype'; // 'roadtype' or 'traffic'
+                this.currentViewMode = 'roadtype'; // 'roadtype' or 'traffic' or 'importance'
                 this.trafficData = {};
+                this.importanceScores = {};
                 
                 // Default city: Bordeaux, France
                 this.defaultCenter = [44.8378, -0.5792];
@@ -302,6 +317,14 @@
                         this.loadTrafficSnapshot(e.target.value);
                     }
                 });
+                
+                document.getElementById('calculateImportanceBtn').addEventListener('click', () => {
+                    this.calculateStreetImportance();
+                });
+                
+                document.getElementById('viewModeSelect').addEventListener('change', (e) => {
+                    this.toggleViewMode(e.target.value);
+                });
             }
             
             clearAll() {
@@ -376,8 +399,10 @@
                     document.getElementById('nodeCount').textContent = `Nodes: ${this.graph.order}`;
                     document.getElementById('edgeCount').textContent = `Streets: ${Object.keys(this.streetLayers).length}`;
                     
-                    // Enable traffic selector
+                    // Enable traffic selector and importance calculation
                     document.getElementById('timePeriodSelect').disabled = false;
+                    document.getElementById('calculateImportanceBtn').disabled = false;
+                    document.getElementById('viewModeSelect').disabled = false;
                     
                     this.updateStatus(`✅ Loaded ${Object.keys(this.streetLayers).length} street segments`);
                     btn.disabled = false;
@@ -647,6 +672,161 @@
                 document.querySelector('.legend-item:nth-child(4) .legend-color').style.background = '#FB923C';
                 document.querySelector('.legend-item:nth-child(5) .legend-color').style.background = '#EF4444';
                 document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#991B1B';
+            }
+            
+            calculateStreetImportance() {
+                this.updateStatus('Calculating street importance...', true);
+                
+                // Set edge weights based on traffic (if available) or default
+                this.graph.forEachEdge((edge, attrs) => {
+                    const traffic = attrs.traffic;
+                    let weight = 1;
+                    
+                    if (traffic) {
+                        // Weight = travel_time * congestion_factor
+                        const speed = traffic.currentSpeed || 50;
+                        const congestionFactor = traffic.freeFlowSpeed / Math.max(speed, 1);
+                        weight = congestionFactor;
+                    }
+                    
+                    this.graph.setEdgeAttribute(edge, 'weight', weight);
+                });
+                
+                // Calculate betweenness centrality
+                const centrality = graphologyLibrary.betweenness(this.graph, { weighted: true });
+                
+                // Normalize scores 0-100
+                const scores = Object.values(centrality);
+                const maxScore = Math.max(...scores);
+                const minScore = Math.min(...scores);
+                const range = maxScore - minScore || 1;
+                
+                this.importanceScores = {};
+                this.graph.forEachEdge((edge, attrs) => {
+                    const sourceScore = centrality[this.graph.source(edge)] || 0;
+                    const targetScore = centrality[this.graph.target(edge)] || 0;
+                    const edgeScore = (sourceScore + targetScore) / 2;
+                    const normalized = ((edgeScore - minScore) / range) * 100;
+                    
+                    this.importanceScores[attrs.edgeId] = Math.round(normalized);
+                    this.graph.setEdgeAttribute(edge, 'importance', normalized);
+                });
+                
+                this.updateStatus('✅ Importance calculated! Switch to "Street Importance" view');
+                document.getElementById('viewModeSelect').value = 'importance';
+                this.toggleViewMode('importance');
+            }
+            
+            toggleViewMode(mode) {
+                this.currentViewMode = mode;
+                
+                if (mode === 'roadtype') {
+                    this.visualizeByRoadType();
+                    this.updateLegendForRoadType();
+                } else if (mode === 'traffic') {
+                    if (Object.keys(this.trafficData).length > 0) {
+                        this.updateTrafficVisualization();
+                        this.updateLegendForTraffic();
+                    } else {
+                        alert('Please load traffic data first');
+                        document.getElementById('viewModeSelect').value = 'roadtype';
+                    }
+                } else if (mode === 'importance') {
+                    if (Object.keys(this.importanceScores).length > 0) {
+                        this.visualizeImportance();
+                        this.updateLegendForImportance();
+                    } else {
+                        alert('Please calculate importance first');
+                        document.getElementById('viewModeSelect').value = 'roadtype';
+                    }
+                }
+            }
+            
+            visualizeByRoadType() {
+                this.graph.forEachEdge((edge, attrs) => {
+                    const layer = this.streetLayers[attrs.edgeId];
+                    if (layer) {
+                        layer.setStyle({
+                            color: this.getRoadColor(attrs.highway),
+                            weight: this.getRoadWeight(attrs.highway),
+                            opacity: 0.7
+                        });
+                    }
+                });
+            }
+            
+            visualizeImportance() {
+                for (const [edgeId, layer] of Object.entries(this.streetLayers)) {
+                    const score = this.importanceScores[edgeId] || 0;
+                    const color = this.getImportanceColor(score);
+                    
+                    layer.setStyle({
+                        color: color,
+                        weight: 3 + (score / 25), // Thicker for more important
+                        opacity: 0.8
+                    });
+                    
+                    // Update popup
+                    this.graph.forEachEdge((edge, attrs) => {
+                        if (attrs.edgeId === edgeId) {
+                            const popup = layer.getPopup();
+                            if (popup) {
+                                const baseContent = popup.getContent().split('<br><strong>Traffic:')[0];
+                                layer.setPopupContent(baseContent + `
+                                    <br><strong>Importance Score: ${score}/100</strong>
+                                    <br>Rank: ${this.getImportanceRank(score)}
+                                `);
+                            }
+                        }
+                    });
+                }
+            }
+            
+            getImportanceColor(score) {
+                // Gradient from blue (low) to red (high)
+                if (score > 80) return '#DC2626'; // Critical
+                if (score > 60) return '#F97316'; // Very important
+                if (score > 40) return '#FACC15'; // Important
+                if (score > 20) return '#4ADE80'; // Moderate
+                return '#60A5FA'; // Low importance
+            }
+            
+            getImportanceRank(score) {
+                if (score > 80) return 'Critical';
+                if (score > 60) return 'Very Important';
+                if (score > 40) return 'Important';
+                if (score > 20) return 'Moderate';
+                return 'Low';
+            }
+            
+            updateLegendForRoadType() {
+                document.getElementById('legendTitle').textContent = 'Road Types:';
+                document.getElementById('legend1').textContent = 'Motorway';
+                document.getElementById('legend2').textContent = 'Primary';
+                document.getElementById('legend3').textContent = 'Secondary';
+                document.getElementById('legend4').textContent = 'Residential';
+                document.getElementById('legend5').textContent = 'Other';
+                
+                document.querySelector('.legend-item:nth-child(2) .legend-color').style.background = '#FF4444';
+                document.querySelector('.legend-item:nth-child(3) .legend-color').style.background = '#FF8800';
+                document.querySelector('.legend-item:nth-child(4) .legend-color').style.background = '#FFB700';
+                document.querySelector('.legend-item:nth-child(5) .legend-color').style.background = '#4CAF50';
+                document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#888888';
+            }
+            
+            updateLegendForImportance() {
+                document.getElementById('legendTitle').textContent = 'Importance:';
+                document.getElementById('legend1').textContent = 'Critical (80-100)';
+                document.getElementById('legend2').textContent = 'Very Important (60-80)';
+                document.getElementById('legend3').textContent = 'Important (40-60)';
+                document.getElementById('legend4').textContent = 'Moderate (20-40)';
+                document.getElementById('legend5').textContent = 'Low (0-20)';
+                
+                document.querySelector('.legend-item:nth-child(2) .legend-color').style.background = '#DC2626';
+                document.querySelector('.legend-item:nth-child(3) .legend-color').style.background = '#F97316';
+                document.querySelector('.legend-item:nth-child(4) .legend-color').style.background = '#FACC15';
+                document.querySelector('.legend-item:nth-child(5) .legend-color').style.background = '#4ADE80';
+                document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#60A5FA';
             }
         }
         
