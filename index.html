@@ -124,6 +124,30 @@
             color: #333;
         }
         
+        .close-btn {
+            background: #000;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-top: 8px;
+            width: 100%;
+            font-size: 12px;
+        }
+        
+        .close-btn:hover {
+            background: #333;
+        }
+        
+        .close-btn.reopen {
+            background: #4CAF50;
+        }
+        
+        .close-btn.reopen:hover {
+            background: #45a049;
+        }
+        
         .closed-street {
             animation: flash 1s ease-in-out;
         }
@@ -948,6 +972,7 @@
                         }
                     });
                     
+                    this.updatePopupButton(edgeId, false);
                     this.updateStatus(`Street reopened. ${this.closedStreets.size} streets closed.`);
                 } else {
                     // Close street
@@ -988,7 +1013,29 @@
                         }
                     }
                     
+                    this.updatePopupButton(edgeId, true);
                     this.updateStatus(`🚧 Street closed! ${this.closedStreets.size} total closures. Finding alternatives...`);
+                }
+                
+                // Close popup after action
+                layer.closePopup();
+            }
+            
+            updatePopupButton(edgeId, isClosed) {
+                const layer = this.streetLayers[edgeId];
+                if (!layer) return;
+                
+                const popup = layer.getPopup();
+                if (popup) {
+                    const content = popup.getContent();
+                    const buttonText = isClosed ? '✅ Reopen Street' : '🚧 Close Street';
+                    const buttonClass = isClosed ? 'close-btn reopen' : 'close-btn';
+                    
+                    const newContent = content.replace(
+                        /<button class="close-btn[^"]*"[^>]*>.*?<\/button>/,
+                        `<button class="${buttonClass}" onclick="analyzer.simulateStreetClosure('${edgeId}'); return false;">${buttonText}</button>`
+                    );
+                    popup.setContent(newContent);
                 }
             }
             
