@@ -130,14 +130,21 @@ class TrafficAnalyzer {
   congestionColor(r){ return r>0.8?'#22C55E':r>0.6?'#FACC15':r>0.4?'#FB923C':r>0.2?'#EF4444':'#991B1B'; }
   importanceColor(s){ return s>80?'#DC2626':s>60?'#F97316':s>40?'#FACC15':s>20?'#4ADE80':'#60A5FA'; }
   rank(s){ return s>80?'Critical':s>60?'Very Important':s>40?'Important':s>20?'Moderate':'Low'; }
+  ensureClass(layer, cls, add=true, tries=10){
+    const apply=()=>{
+      const el = layer.getElement && layer.getElement();
+      if(!el){ if(tries>0) requestAnimationFrame(()=>this.ensureClass(layer,cls,add,tries-1)); return; }
+      add ? el.classList.add(cls) : el.classList.remove(cls);
+    }; apply();
+  }
 
   async loadOSM(){
-    this.resetState(true);
+    this.resetState(true); Q('#btnLoad').disabled=true;
     this.status('Loading street network…',true);
 
     let query;
     if(this.poly){
-      const latlngs=this.poly.getLatLngs()[0]; if(!latlngs?.length){ this.status('Invalid polygon.'); return; }
+      const latlngs=this.poly.getLatLngs()[0]; if(!latlngs?.length){ this.status('Invalid polygon.'); Q('#btnLoad').disabled=false; return; }
       const polyStr=latlngs.map(ll=>`${ll.lat} ${ll.lng}`).join(' ');
       query=`[out:json][timeout:60];(way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](poly:"${polyStr}"););out body;>;out skel qt;`;
     } else {
@@ -156,7 +163,7 @@ class TrafficAnalyzer {
           this.ways[e.id]={wayId:e.id,name:e.tags.name||'Unnamed',highway:e.tags.highway,maxspeed:e.tags.maxspeed||'Unknown',coords,nodeIds:e.nodes.slice(),lenKm:this.lengthKm(coords),oneway:e.tags.oneway==='yes'};
         }
       });
-      if(!Object.keys(this.ways).length){ this.status('No streets found.'); return; }
+      if(!Object.keys(this.ways).length){ this.status('No streets found.'); Q('#btnLoad').disabled=false; return; }
 
       this.buildCompressedGraph(); this.drawWays();
       this.originalGraph=this.graph.copy();
@@ -166,6 +173,7 @@ class TrafficAnalyzer {
       ['#selPeriod','#btnImportance','#selView','#btnReset','#btnCloseMode'].forEach(s=>Q(s).disabled=false);
       this.status(`✅ Loaded ${Object.keys(this.ways).length} streets`);
     }catch(e){ console.error(e); this.status('Error loading street data. Try again.'); }
+    Q('#btnLoad').disabled=false;
   }
 
   buildCompressedGraph(){
@@ -256,12 +264,11 @@ class TrafficAnalyzer {
 
   calculateImportance(){
     this.status('Calculating importance…',true);
-    // edge cost = time*volume; seed from current traffic if available
     this.graph.forEachEdge((k,a)=>{
       const t=this.traffic[a.wayId]||this.baseTraffic[a.wayId];
       const speed=Math.max(5,(t?.current)||50), free=Math.max(5,(t?.free)||speed);
       const vol=1 + 0.6*Math.max(0,(free/speed)-1);
-      const cost=(a.lenKm/ speed) * vol; // hours * volume
+      const cost=(a.lenKm/ speed) * vol;
       this.graph.setEdgeAttribute(k,'cost',cost);
     });
     let nodeC=null;
@@ -344,21 +351,20 @@ class TrafficAnalyzer {
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.add(wayId);
     layer.setStyle({color:'#000',opacity:.95,weight:6,dashArray:'10,8'}); layer.bringToFront();
-    const el=layer.getElement?.(); if(el){ el.classList.add('closed'); el.classList.remove('altPulse'); }
+    this.ensureClass(layer,'closed',true);
 
     // remove edges for this way
     (this.edgesByWay[wayId]||[]).forEach(k=>{ if(this.graph.hasEdge(k)) this.graph.dropEdge(k); });
 
-    // compute volume from closed way and redistribute
+    // compute volume and alternatives
     const volume=this.computeClosedVolume(wayId);
-    const {s,t}=this.wayEndpoints(wayId);
-    const alts=this.findAlternatives(s,t,3,5); // BFS: up to 3 paths, max 5 hops
-    this.redistributeTrafficVolume(volume, alts);
+    const {s,t}=this.getConnectorEndpoints(wayId);
+    const alts=this.findAlternatives(s,t,3,5);
 
-    // animate alternatives (red pulsing)
+    // redistribute and animate
+    this.redistributeTrafficVolume(volume, alts);
     this.animateAlternatives(alts);
 
-    // repaint traffic if visible
     if(this.viewMode==='traffic') this.renderTraffic();
     this.status(`🚧 Closed: ${this.ways[wayId]?.name || wayId}. Total closures: ${this.closedWays.size}.`);
   }
@@ -366,94 +372,112 @@ class TrafficAnalyzer {
   reopenWay(wayId){
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.delete(wayId);
-    const w=this.ways[wayId];
-    layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85,dashArray:null});
-    const el=layer.getElement?.(); if(el){ el.classList.remove('closed'); el.classList.remove('altPulse'); }
 
-    // re-add original edges
+    const w=this.ways[wayId], t=this.traffic[wayId]||this.baseTraffic[wayId];
+    if(this.viewMode==='traffic' && t){
+      const r=Math.max(0.01,(t.current/Math.max(1,t.free)));
+      layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.95,dashArray:null});
+    } else if(this.viewMode==='importance' && this.importance[wayId]!=null){
+      const s=this.importance[wayId]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.95,dashArray:null});
+    } else {
+      layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85,dashArray:null});
+    }
+    this.ensureClass(layer,'closed',false); this.ensureClass(layer,'altPulse',false);
+
+    // re-add original edges for this way
     this.originalGraph.forEachEdge((key,attrs,src,tgt)=>{ if(attrs.wayId===wayId && !this.graph.hasEdge(key)) this.graph.addEdgeWithKey(key,src,tgt,attrs); });
 
-    // recompute network load from remaining closures (resets weights and re-applies)
+    // recompute loads for any remaining closures
     this.recomputeNetworkLoadFromClosures(true);
     this.status(`Reopened: ${w.name}. Total closures: ${this.closedWays.size}.`);
   }
 
   recomputeNetworkLoadFromClosures(repaint=false){
     // reset edge weights
-    this.graph.forEachEdge((k,a)=>this.graph.setEdgeAttribute(k,'weight',1));
-    // reset traffic to current period/base
-    const fresh={}; const src = Object.keys(this.traffic).length? this.traffic : this.baseTraffic;
-    Object.keys(src).forEach(wid=>{ fresh[wid]={...src[wid]}; });
+    this.graph.forEachEdge((k)=>this.graph.setEdgeAttribute(k,'weight',1));
+    // reset traffic to the current period/base
+    const base = Object.keys(this.traffic).length ? this.traffic : this.baseTraffic;
+    const fresh={}; Object.keys(base).forEach(wid=>fresh[wid]={...base[wid]});
     this.traffic=fresh;
 
     // apply all closures again
     this.closedWays.forEach(wid=>{
       const vol=this.computeClosedVolume(wid);
-      const {s,t}=this.wayEndpoints(wid);
+      const {s,t}=this.getConnectorEndpoints(wid);
       const alts=this.findAlternatives(s,t,3,5);
       this.redistributeTrafficVolume(vol, alts);
     });
+
     if(repaint && this.viewMode==='traffic') this.renderTraffic();
   }
 
-  // 2) Alternative Route Finding: BFS up to maxPaths, avoids closed (edges dropped), maxHops
+  // 2) Alternative Route Finding: BFS up to 3 paths, avoids closed, max 5 hops, undirected adjacency
   findAlternatives(source,target,maxPaths=3,maxHops=5){
-    const paths=[]; const q=[[source]];
-    while(q.length && paths.length<maxPaths){
-      const p=q.shift(); const v=p[p.length-1];
-      if(v===target && p.length>1){ paths.push(p); continue; }
-      if((p.length-1)>=maxHops) continue;
-      this.graph.outNeighbors(v).forEach(n=>{
-        if(p.includes(n)) return;
-        const k=this.graph.edge(v,n); if(!k) return; // closed or no edge
-        const a=this.graph.getEdgeAttributes(k); if(this.closedWays.has(a.wayId)) return;
-        q.push([...p,n]);
-      });
+    const res=[]; if(!source||!target||!this.graph.hasNode(source)||!this.graph.hasNode(target)) return res;
+    const q=[[source]];
+    while(q.length && res.length<maxPaths){
+      const path=q.shift(), v=path[path.length-1];
+      if(v===target && path.length>1){ res.push(path); continue; }
+      if((path.length-1)>=maxHops) continue;
+      const neighs=this.graph.neighbors(v) || [];
+      for(const n of neighs){
+        if(path.includes(n)) continue;
+        let ek=this.graph.edge(v,n); if(!ek) ek=this.graph.edge(n,v);
+        if(!ek) continue;
+        const a=this.graph.getEdgeAttributes(ek); if(!a || this.closedWays.has(a.wayId)) continue;
+        q.push([...path,n]);
+      }
     }
-    // convert to edges
-    return paths.map(p=>{ const edges=[]; for(let i=0;i<p.length-1;i++){ const k=this.graph.edge(p[i],p[i+1]); if(k) edges.push(k); } return edges; }).filter(e=>e.length);
+    return res.map(p=>{
+      const edges=[]; for(let i=0;i<p.length-1;i++){ let ek=this.graph.edge(p[i],p[i+1]); if(!ek) ek=this.graph.edge(p[i+1],p[i]); if(ek) edges.push(ek); }
+      return edges;
+    }).filter(es=>es.length);
   }
 
-  // 3) Traffic Redistribution: compute volume, distribute to alternatives, update edge weights and speeds
+  getConnectorEndpoints(wayId){
+    const w=this.ways[wayId]; if(!w) return {s:null,t:null};
+    const ids=w.nodeIds.filter(id=>this.graph.hasNode(id));
+    if(!ids.length) return {s:null,t:null};
+    let s=null,t=null;
+    for(let i=0;i<ids.length;i++){ if(this.graph.degree(ids[i])>0){ s=ids[i]; break; } }
+    for(let i=ids.length-1;i>=0;i--){ if(this.graph.degree(ids[i])>0){ t=ids[i]; break; } }
+    if(!s) s=ids[0]; if(!t) t=ids[ids.length-1];
+    return {s,t};
+  }
+
+  // 3) Traffic Redistribution
   computeClosedVolume(wayId){
     const w=this.ways[wayId]; if(!w) return 0.5;
     const t=this.baseTraffic[wayId]||this.traffic[wayId]||{current:30,free:50};
-    const vol = w.lenKm * (t.free/Math.max(5,t.current)); // rough demand units
+    const vol = w.lenKm * (t.free/Math.max(5,t.current));
     return Math.max(0.2, vol);
   }
 
   redistributeTrafficVolume(volume, altPaths){
     if(!altPaths.length) return;
-    // path costs (inverse of travel-time attracts more)
-    const eps=1e-3, pathCost=[], invs=[];
+    const eps=1e-3, invs=[], costs=[];
     altPaths.forEach(edges=>{
       let cost=0; edges.forEach(k=>{
         const a=this.graph.getEdgeAttributes(k);
         const t=this.traffic[a.wayId]||this.baseTraffic[a.wayId]||{current:40,free:50};
         const speed=Math.max(5,t.current); cost += (a.lenKm/ speed);
-      }); pathCost.push(cost); invs.push(1/Math.max(eps,cost));
+      }); costs.push(cost); invs.push(1/Math.max(eps,cost));
     });
     const invSum=invs.reduce((s,x)=>s+x,0)||1;
 
-    // distribute volume across paths then across edges by length share; update edge weights and speeds
     const addedPerWay={};
     altPaths.forEach((edges,idx)=>{
-      const pathShare=(invs[idx]/invSum);
-      const pathVol=volume*pathShare;
-      let totalLen=edges.reduce((s,k)=>s+(this.graph.getEdgeAttribute(k,'lenKm')||0.05),0.05);
+      const pathVol=volume*(invs[idx]/invSum);
+      const totalLen=edges.reduce((s,k)=>s+(this.graph.getEdgeAttribute(k,'lenKm')||0.05),0.05);
       edges.forEach(k=>{
         const a=this.graph.getEdgeAttributes(k);
-        const edgeShare=(a.lenKm||0.05)/totalLen;
-        const edgeVol=pathVol*edgeShare;
-        // bump edge weight
+        const edgeVol=pathVol*((a.lenKm||0.05)/totalLen);
         const baseW=this.graph.getEdgeAttribute(k,'weight')||1;
         this.graph.setEdgeAttribute(k,'weight', baseW + edgeVol);
-        // accumulate per-way pressure
         addedPerWay[a.wayId]=(addedPerWay[a.wayId]||0)+edgeVol;
       });
     });
 
-    // adjust speeds for impacted ways (simple slowdown)
     Object.entries(addedPerWay).forEach(([wid,press])=>{
       const t=this.traffic[wid]; if(!t) return;
       const factor=1/(1+0.25*press);
@@ -461,16 +485,18 @@ class TrafficAnalyzer {
     });
   }
 
-  // 4) Visual animations for alternatives
+  // 4) Visual: alternatives pulsing red
   animateAlternatives(altPaths){
     const seenWays=new Set();
     altPaths.forEach((edges,i)=>{
       edges.forEach(k=>{
-        const a=this.graph.getEdgeAttributes(k); const wid=a.wayId; if(!wid||this.closedWays.has(wid)||seenWays.has(wid)) return;
-        seenWays.add(wid); const layer=this.layers[wid]; if(!layer) return;
+        const a=this.graph.getEdgeAttributes(k); const wid=a?.wayId;
+        if(!wid || this.closedWays.has(wid) || seenWays.has(wid)) return;
+        seenWays.add(wid);
+        const layer=this.layers[wid]; if(!layer) return;
         layer.setStyle({color:'#E11D48',weight:5,opacity:.98}); layer.bringToFront();
-        const el=layer.getElement?.(); if(el) el.classList.add('altPulse');
-        setTimeout(()=>{ // revert style after pulse
+        this.ensureClass(layer,'altPulse',true);
+        setTimeout(()=>{ // revert after pulse
           if(this.closedWays.has(wid)) return;
           if(this.viewMode==='traffic' && this.traffic[wid]){
             const t=this.traffic[wid]; const r=Math.max(0.01,t.current/Math.max(1,t.free));
@@ -480,13 +506,11 @@ class TrafficAnalyzer {
           } else {
             const w=this.ways[wid]; layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85});
           }
-          const el2=layer.getElement?.(); if(el2) el2.classList.remove('altPulse');
+          this.ensureClass(layer,'altPulse',false);
         }, 2800 + i*120);
       });
     });
   }
-
-  wayEndpoints(wid){ const w=this.ways[wid]; return {s:w.nodeIds[0], t:w.nodeIds[w.nodeIds.length-1]}; }
 
   resetClosures(){
     Array.from(this.closedWays).forEach(wid=>this.reopenWay(wid));
