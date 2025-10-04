@@ -124,6 +124,24 @@
             color: #333;
         }
         
+        .closed-street {
+            animation: flash 1s ease-in-out;
+        }
+        
+        @keyframes flash {
+            0%, 100% { opacity: 0.8; }
+            50% { opacity: 1; }
+        }
+        
+        .alternative-route {
+            animation: pulse 2s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+        
         .stats {
             margin-top: 10px;
             padding: 10px;
@@ -173,6 +191,13 @@
                 <option value="importance">Street Importance</option>
             </select>
         </div>
+        
+        <div style="margin-top: 15px; padding: 10px; background: #FFF3CD; border-radius: 4px; font-size: 12px;">
+            <strong>🚧 Simulation Mode:</strong>
+            <div style="margin-top: 5px;">Click streets to close/open them</div>
+        </div>
+        
+        <button id="resetSimulationBtn" class="btn" style="background: #FF9800; margin-top: 10px;" disabled>Reset Closures</button>
         
         <button id="clearBtn" class="btn btn-clear">Clear All</button>
         
@@ -227,6 +252,8 @@
                 this.currentViewMode = 'roadtype'; // 'roadtype' or 'traffic' or 'importance'
                 this.trafficData = {};
                 this.importanceScores = {};
+                this.closedStreets = new Set();
+                this.originalGraph = null;
                 
                 // Default city: Bordeaux, France
                 this.defaultCenter = [44.8378, -0.5792];
@@ -324,6 +351,10 @@
                 document.getElementById('viewModeSelect').addEventListener('change', (e) => {
                     this.toggleViewMode(e.target.value);
                 });
+                
+                document.getElementById('resetSimulationBtn').addEventListener('click', () => {
+                    this.resetSimulation();
+                });
             }
             
             clearAll() {
@@ -402,6 +433,10 @@
                     document.getElementById('timePeriodSelect').disabled = false;
                     document.getElementById('calculateImportanceBtn').disabled = false;
                     document.getElementById('viewModeSelect').disabled = false;
+                    document.getElementById('resetSimulationBtn').disabled = false;
+                    
+                    // Save original graph for simulation resets
+                    this.originalGraph = this.graph.copy();
                     
                     this.updateStatus(`✅ Loaded ${Object.keys(this.streetLayers).length} street segments`);
                     btn.disabled = false;
@@ -887,6 +922,189 @@
                 document.querySelector('.legend-item:nth-child(4) .legend-color').style.background = '#FACC15';
                 document.querySelector('.legend-item:nth-child(5) .legend-color').style.background = '#4ADE80';
                 document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#60A5FA';
+            }
+            
+            simulateStreetClosure(edgeId) {
+                const layer = this.streetLayers[edgeId];
+                if (!layer) return;
+                
+                // Toggle closure
+                if (this.closedStreets.has(edgeId)) {
+                    // Reopen street
+                    this.closedStreets.delete(edgeId);
+                    layer.setStyle({ 
+                        opacity: 0.7,
+                        dashArray: null,
+                        className: ''
+                    });
+                    
+                    // Re-add edge to graph
+                    this.graph.forEachEdge((edge, attrs) => {
+                        if (attrs.edgeId === edgeId && this.originalGraph.hasEdge(edge)) {
+                            const origAttrs = this.originalGraph.getEdgeAttributes(edge);
+                            Object.keys(origAttrs).forEach(key => {
+                                this.graph.setEdgeAttribute(edge, key, origAttrs[key]);
+                            });
+                        }
+                    });
+                    
+                    this.updateStatus(`Street reopened. ${this.closedStreets.size} streets closed.`);
+                } else {
+                    // Close street
+                    this.closedStreets.add(edgeId);
+                    layer.setStyle({ 
+                        color: '#000000',
+                        opacity: 0.5,
+                        dashArray: '10, 10',
+                        weight: 5,
+                        className: 'closed-street'
+                    });
+                    
+                    // Find edge in graph and get traffic
+                    let closedEdge = null;
+                    let closedTraffic = 0;
+                    this.graph.forEachEdge((edge, attrs) => {
+                        if (attrs.edgeId === edgeId) {
+                            closedEdge = edge;
+                            closedTraffic = attrs.traffic ? 
+                                (attrs.traffic.freeFlowSpeed / Math.max(attrs.traffic.currentSpeed, 1)) : 1;
+                        }
+                    });
+                    
+                    if (closedEdge) {
+                        const source = this.graph.source(closedEdge);
+                        const target = this.graph.target(closedEdge);
+                        
+                        // Remove edge temporarily
+                        this.graph.dropEdge(closedEdge);
+                        
+                        // Find alternative routes
+                        const alternatives = this.findAlternativeRoutes(source, target);
+                        
+                        // Redistribute traffic
+                        if (alternatives.length > 0) {
+                            this.estimateTrafficRedistribution(closedTraffic, alternatives);
+                            this.visualizeClosureImpact(alternatives);
+                        }
+                    }
+                    
+                    this.updateStatus(`🚧 Street closed! ${this.closedStreets.size} total closures. Finding alternatives...`);
+                }
+            }
+            
+            findAlternativeRoutes(source, target) {
+                // BFS to find alternative paths
+                const queue = [[source]];
+                const visited = new Set([source]);
+                const alternatives = [];
+                const maxPaths = 3;
+                
+                while (queue.length > 0 && alternatives.length < maxPaths) {
+                    const path = queue.shift();
+                    const current = path[path.length - 1];
+                    
+                    if (current === target && path.length > 1) {
+                        // Found alternative path
+                        const edges = [];
+                        for (let i = 0; i < path.length - 1; i++) {
+                            const edge = this.graph.edge(path[i], path[i + 1]);
+                            if (edge) edges.push(edge);
+                        }
+                        alternatives.push({ path, edges });
+                        continue;
+                    }
+                    
+                    if (path.length > 5) continue; // Limit path length
+                    
+                    const neighbors = this.graph.neighbors(current);
+                    for (const neighbor of neighbors) {
+                        if (!path.includes(neighbor)) {
+                            queue.push([...path, neighbor]);
+                        }
+                    }
+                }
+                
+                return alternatives;
+            }
+            
+            estimateTrafficRedistribution(closedTraffic, alternatives) {
+                if (alternatives.length === 0) return;
+                
+                // Distribute traffic proportionally to alternative routes
+                const trafficPerRoute = closedTraffic / alternatives.length;
+                
+                alternatives.forEach(alt => {
+                    alt.edges.forEach(edge => {
+                        const attrs = this.graph.getEdgeAttributes(edge);
+                        const currentWeight = attrs.weight || 1;
+                        const newWeight = currentWeight + (trafficPerRoute * 0.5);
+                        
+                        this.graph.setEdgeAttribute(edge, 'weight', newWeight);
+                        this.graph.setEdgeAttribute(edge, 'redistributed', true);
+                    });
+                });
+            }
+            
+            visualizeClosureImpact(alternatives) {
+                // Highlight alternative routes
+                alternatives.forEach((alt, index) => {
+                    alt.edges.forEach(edge => {
+                        const attrs = this.graph.getEdgeAttributes(edge);
+                        const layer = this.streetLayers[attrs.edgeId];
+                        
+                        if (layer && !this.closedStreets.has(attrs.edgeId)) {
+                            // Animate alternative routes
+                            setTimeout(() => {
+                                layer.setStyle({
+                                    color: '#FF6B6B',
+                                    weight: 5,
+                                    opacity: 0.9,
+                                    className: 'alternative-route'
+                                });
+                            }, index * 200);
+                            
+                            // Reset after animation
+                            setTimeout(() => {
+                                if (!this.closedStreets.has(attrs.edgeId)) {
+                                    const color = this.currentViewMode === 'importance' 
+                                        ? this.getImportanceColor(this.importanceScores[attrs.edgeId] || 0)
+                                        : this.getRoadColor(attrs.highway);
+                                    layer.setStyle({
+                                        color: color,
+                                        weight: 4,
+                                        opacity: 0.8,
+                                        className: ''
+                                    });
+                                }
+                            }, 3000 + index * 200);
+                        }
+                    });
+                });
+            }
+            
+            resetSimulation() {
+                // Reopen all streets
+                this.closedStreets.forEach(edgeId => {
+                    const layer = this.streetLayers[edgeId];
+                    if (layer) {
+                        layer.setStyle({ 
+                            opacity: 0.7,
+                            dashArray: null,
+                            className: ''
+                        });
+                    }
+                });
+                
+                this.closedStreets.clear();
+                
+                // Restore original graph
+                if (this.originalGraph) {
+                    this.graph = this.originalGraph.copy();
+                }
+                
+                // Refresh visualization
+                this.toggleViewMode(this.currentViewMode);
+                this.updateStatus('✅ All closures reset');
             }
         }
         
