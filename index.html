@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Urban Traffic Analyzer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        #map {
+            height: 100vh;
+            width: 100%;
+        }
+        
+        .control-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 1000;
+            max-width: 300px;
+        }
+        
+        .control-panel h3 {
+            margin-bottom: 15px;
+            color: #333;
+            font-size: 18px;
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #45a049;
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            margin-top: 15px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            font-size: 12px;
+            color: #666;
+        }
+        
+        .legend {
+            margin-top: 15px;
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        
+        .legend-color {
+            width: 30px;
+            height: 3px;
+            margin-right: 10px;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        
+        .street-popup {
+            font-size: 13px;
+        }
+        
+        .street-popup strong {
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <div class="control-panel">
+        <h3>🚦 Traffic Analyzer</h3>
+        <button id="loadStreetsBtn" class="btn">Load Street Network</button>
+        <div id="status" class="status">Ready to load street data</div>
+        
+        <div class="legend">
+            <strong>Road Types:</strong>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF4444;"></div>
+                <span>Motorway</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FF8800;"></div>
+                <span>Primary</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #FFB700;"></div>
+                <span>Secondary</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #4CAF50;"></div>
+                <span>Residential</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background: #888888;"></div>
+                <span>Other</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/graphology/dist/graphology.umd.js"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    
+    <script>
+        class TrafficAnalyzer {
+            constructor() {
+                this.map = null;
+                this.graph = new graphology.Graph();
+                this.streetLayers = {};
+                this.osmData = null;
+                
+                // Default city: Bordeaux, France
+                this.defaultCenter = [44.8378, -0.5792];
+                this.defaultZoom = 14;
+            }
+            
+            async initialize() {
+                this.setupMap();
+                this.setupEventHandlers();
+                this.updateStatus('Map ready. Click "Load Street Network" to begin.');
+            }
+            
+            setupMap() {
+                // Initialize Leaflet map
+                this.map = L.map('map').setView(this.defaultCenter, this.defaultZoom);
+                
+                // Add OpenStreetMap base layer
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '© OpenStreetMap contributors',
+                    maxZoom: 19
+                }).addTo(this.map);
+                
+                console.log('Map initialized');
+            }
+            
+            setupEventHandlers() {
+                document.getElementById('loadStreetsBtn').addEventListener('click', () => {
+                    this.loadOSMData();
+                });
+            }
+            
+            async loadOSMData() {
+                const btn = document.getElementById('loadStreetsBtn');
+                btn.disabled = true;
+                this.updateStatus('Loading street network...', true);
+                
+                try {
+                    // Get current map bounds
+                    const bounds = this.map.getBounds();
+                    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+                    
+                    // Overpass API query for streets
+                    const query = `
+                        [out:json][timeout:25];
+                        (
+                          way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](${bbox});
+                        );
+                        out body;
+                        >;
+                        out skel qt;
+                    `;
+                    
+                    const response = await axios.post(
+                        'https://overpass-api.de/api/interpreter',
+                        query,
+                        { headers: { 'Content-Type': 'text/plain' } }
+                    );
+                    
+                    this.osmData = response.data;
+                    console.log('OSM data loaded:', this.osmData.elements.length, 'elements');
+                    
+                    // Parse and visualize
+                    this.parseOSMIntoGraph();
+                    this.visualizeStreets();
+                    
+                    this.updateStatus(`Loaded ${Object.keys(this.streetLayers).length} streets`);
+                    btn.disabled = false;
+                    
+                } catch (error) {
+                    console.error('Error loading OSM data:', error);
+                    this.updateStatus('Error loading street data. Please try again.');
+                    btn.disabled = false;
+                }
+            }
+            
+            parseOSMIntoGraph() {
+                // Clear existing graph
+                this.graph.clear();
+                
+                // First pass: collect all nodes
+                const nodes = {};
+                this.osmData.elements.forEach(element => {
+                    if (element.type === 'node') {
+                        nodes[element.id] = {
+                            lat: element.lat,
+                            lon: element.lon
+                        };
+                    }
+                });
+                
+                // Second pass: process ways (streets)
+                this.osmData.elements.forEach(element => {
+                    if (element.type === 'way' && element.tags && element.tags.highway) {
+                        const wayId = element.id;
+                        const nodeIds = element.nodes;
+                        
+                        // Add nodes to graph if not already present
+                        nodeIds.forEach(nodeId => {
+                            if (!this.graph.hasNode(nodeId) && nodes[nodeId]) {
+                                this.graph.addNode(nodeId, {
+                                    lat: nodes[nodeId].lat,
+                                    lon: nodes[nodeId].lon
+                                });
+                            }
+                        });
+                        
+                        // Add edges between consecutive nodes
+                        for (let i = 0; i < nodeIds.length - 1; i++) {
+                            const source = nodeIds[i];
+                            const target = nodeIds[i + 1];
+                            
+                            if (nodes[source] && nodes[target]) {
+                                const edgeId = `${wayId}_${i}`;
+                                
+                                if (!this.graph.hasEdge(edgeId)) {
+                                    this.graph.addEdge(source, target, edgeId, {
+                                        wayId: wayId,
+                                        highway: element.tags.highway,
+                                        name: element.tags.name || 'Unnamed',
+                                        maxspeed: element.tags.maxspeed || 'Unknown',
+                                        coordinates: [
+                                            [nodes[source].lat, nodes[source].lon],
+                                            [nodes[target].lat, nodes[target].lon]
+                                        ]
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                console.log('Graph built:', this.graph.order, 'nodes,', this.graph.size, 'edges');
+            }
+            
+            visualizeStreets() {
+                // Clear existing layers
+                Object.values(this.streetLayers).forEach(layer => {
+                    this.map.removeLayer(layer);
+                });
+                this.streetLayers = {};
+                
+                // Draw each edge
+                this.graph.forEachEdge((edge, attributes, source, target) => {
+                    const coords = attributes.coordinates;
+                    const color = this.getRoadColor(attributes.highway);
+                    const weight = this.getRoadWeight(attributes.highway);
+                    
+                    const polyline = L.polyline(coords, {
+                        color: color,
+                        weight: weight,
+                        opacity: 0.7
+                    }).addTo(this.map);
+                    
+                    // Add popup with street info
+                    const popupContent = `
+                        <div class="street-popup">
+                            <strong>${attributes.name}</strong><br>
+                            Type: ${attributes.highway}<br>
+                            Max Speed: ${attributes.maxspeed}<br>
+                            Edge ID: ${edge}
+                        </div>
+                    `;
+                    polyline.bindPopup(popupContent);
+                    
+                    this.streetLayers[edge] = polyline;
+                });
+            }
+            
+            getRoadColor(highway) {
+                const colors = {
+                    'motorway': '#FF4444',
+                    'motorway_link': '#FF4444',
+                    'trunk': '#FF6644',
+                    'trunk_link': '#FF6644',
+                    'primary': '#FF8800',
+                    'primary_link': '#FF8800',
+                    'secondary': '#FFB700',
+                    'secondary_link': '#FFB700',
+                    'tertiary': '#FFDD00',
+                    'residential': '#4CAF50',
+                    'unclassified': '#999999',
+                    'living_street': '#4CAF50'
+                };
+                
+                return colors[highway] || '#888888';
+            }
+            
+            getRoadWeight(highway) {
+                const weights = {
+                    'motorway': 4,
+                    'motorway_link': 3,
+                    'trunk': 4,
+                    'trunk_link': 3,
+                    'primary': 3,
+                    'primary_link': 2,
+                    'secondary': 2,
+                    'secondary_link': 2,
+                    'tertiary': 2,
+                    'residential': 1.5,
+                    'unclassified': 1.5
+                };
+                
+                return weights[highway] || 1.5;
+            }
+            
+            updateStatus(message, loading = false) {
+                const statusDiv = document.getElementById('status');
+                statusDiv.innerHTML = loading ? `<div class="loading">${message}</div>` : message;
+            }
+        }
+        
+        // Initialize the application
+        const analyzer = new TrafficAnalyzer();
+        analyzer.initialize();
+    </script>
+</body>
+</html>
