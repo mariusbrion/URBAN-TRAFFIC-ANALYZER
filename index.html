@@ -372,15 +372,22 @@
                 
                 // Clear streets
                 Object.values(this.streetLayers).forEach(layer => {
+                    const el = layer.getElement?.();
+                    if (el) {
+                        el.classList.remove('closed-street', 'alternative-route');
+                    }
                     this.map.removeLayer(layer);
                 });
                 this.streetLayers = {};
                 
                 // Clear graph
                 this.graph.clear();
+                this.closedStreets.clear();
+                this.selectedStreet = null;
                 
                 // Reset UI
                 document.getElementById('loadStreetsBtn').disabled = true;
+                document.getElementById('closeSelectedBtn').disabled = true;
                 document.getElementById('stats').style.display = 'none';
                 this.updateStatus('Draw a polygon to select an area');
             }
@@ -949,6 +956,14 @@
                                 prevLayer.setStyle({ color, weight: 3, opacity: 0.7 });
                             }
                         });
+                    } else {
+                        // Keep closed styling
+                        prevLayer.setStyle({ 
+                            color: '#000000',
+                            opacity: 0.5,
+                            dashArray: '10, 10',
+                            weight: 5
+                        });
                     }
                 }
                 
@@ -977,7 +992,7 @@
                 }
                 
                 document.getElementById('closeSelectedBtn').disabled = false;
-                this.updateStatus(`Street selected: Click "Close Selected Street" button to close/reopen`);
+                this.updateStatus(`Street selected: Click button to ${this.closedStreets.has(edgeId) ? 'reopen' : 'close'}`);
             }
             
             simulateStreetClosure(edgeId) {
@@ -1124,9 +1139,10 @@
                                 layer.setStyle({
                                     color: '#FF6B6B',
                                     weight: 5,
-                                    opacity: 0.9,
-                                    className: 'alternative-route'
+                                    opacity: 0.9
                                 });
+                                const el = layer.getElement?.();
+                                if (el) el.classList.add('alternative-route');
                             }, index * 200);
                             
                             // Reset after animation
@@ -1138,9 +1154,10 @@
                                     layer.setStyle({
                                         color: color,
                                         weight: 4,
-                                        opacity: 0.8,
-                                        className: ''
+                                        opacity: 0.8
                                     });
+                                    const el = layer.getElement?.();
+                                    if (el) el.classList.remove('alternative-route');
                                 }
                             }, 3000 + index * 200);
                         }
@@ -1155,9 +1172,10 @@
                     if (layer) {
                         layer.setStyle({ 
                             opacity: 0.7,
-                            dashArray: null,
-                            className: ''
+                            dashArray: null
                         });
+                        const el = layer.getElement?.();
+                        if (el) el.classList.remove('closed-street');
                     }
                 });
                 
