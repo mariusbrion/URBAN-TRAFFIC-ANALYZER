@@ -148,6 +148,19 @@
         </div>
         
         <button id="loadStreetsBtn" class="btn" disabled>Load Street Network</button>
+        
+        <div style="margin-top: 15px;">
+            <label style="font-size: 13px; color: #666; display: block; margin-bottom: 5px;">
+                <strong>Traffic Period:</strong>
+            </label>
+            <select id="timePeriodSelect" class="btn" style="padding: 8px;" disabled>
+                <option value="">Select period...</option>
+                <option value="morning">Morning Rush (7-9 AM)</option>
+                <option value="evening">Evening Rush (5-7 PM)</option>
+                <option value="offpeak">Off-Peak (2-4 PM)</option>
+            </select>
+        </div>
+        
         <button id="clearBtn" class="btn btn-clear">Clear All</button>
         
         <div id="status" class="status">Draw a polygon to get started</div>
@@ -159,26 +172,26 @@
         </div>
         
         <div class="legend">
-            <strong>Road Types:</strong>
+            <strong id="legendTitle">Road Types:</strong>
             <div class="legend-item">
                 <div class="legend-color" style="background: #FF4444;"></div>
-                <span>Motorway</span>
+                <span id="legend1">Motorway</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #FF8800;"></div>
-                <span>Primary</span>
+                <span id="legend2">Primary</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #FFB700;"></div>
-                <span>Secondary</span>
+                <span id="legend3">Secondary</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #4CAF50;"></div>
-                <span>Residential</span>
+                <span id="legend4">Residential</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: #888888;"></div>
-                <span>Other</span>
+                <span id="legend5">Other</span>
             </div>
         </div>
     </div>
@@ -197,6 +210,9 @@
                 this.osmData = null;
                 this.drawnItems = null;
                 this.selectedPolygon = null;
+                this.tomtomApiKey = '2hRMy8jfLxTGLUhZ3UJNoqAlihmLd9PA';
+                this.currentViewMode = 'roadtype'; // 'roadtype' or 'traffic'
+                this.trafficData = {};
                 
                 // Default city: Bordeaux, France
                 this.defaultCenter = [44.8378, -0.5792];
@@ -280,6 +296,12 @@
                 document.getElementById('clearBtn').addEventListener('click', () => {
                     this.clearAll();
                 });
+                
+                document.getElementById('timePeriodSelect').addEventListener('change', (e) => {
+                    if (e.target.value) {
+                        this.loadTrafficSnapshot(e.target.value);
+                    }
+                });
             }
             
             clearAll() {
@@ -353,6 +375,9 @@
                     document.getElementById('stats').style.display = 'block';
                     document.getElementById('nodeCount').textContent = `Nodes: ${this.graph.order}`;
                     document.getElementById('edgeCount').textContent = `Streets: ${Object.keys(this.streetLayers).length}`;
+                    
+                    // Enable traffic selector
+                    document.getElementById('timePeriodSelect').disabled = false;
                     
                     this.updateStatus(`✅ Loaded ${Object.keys(this.streetLayers).length} street segments`);
                     btn.disabled = false;
@@ -509,6 +534,119 @@
             updateStatus(message, loading = false) {
                 const statusDiv = document.getElementById('status');
                 statusDiv.innerHTML = loading ? `<div class="loading">${message}</div>` : message;
+            }
+            
+            async loadTrafficSnapshot(timePeriod) {
+                this.updateStatus(`Loading ${timePeriod} traffic data...`, true);
+                this.currentViewMode = 'traffic';
+                this.trafficData = {};
+                
+                let successCount = 0;
+                let totalStreets = 0;
+                
+                // Sample points from each street
+                for (const [edgeId, layer] of Object.entries(this.streetLayers)) {
+                    totalStreets++;
+                    const coords = layer.getLatLngs();
+                    const midPoint = coords[Math.floor(coords.length / 2)];
+                    
+                    try {
+                        const response = await axios.get(
+                            `https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json`,
+                            {
+                                params: {
+                                    key: this.tomtomApiKey,
+                                    point: `${midPoint.lat},${midPoint.lng}`
+                                }
+                            }
+                        );
+                        
+                        if (response.data.flowSegmentData) {
+                            const flowData = response.data.flowSegmentData;
+                            this.trafficData[edgeId] = {
+                                currentSpeed: flowData.currentSpeed,
+                                freeFlowSpeed: flowData.freeFlowSpeed,
+                                confidence: flowData.confidence
+                            };
+                            
+                            // Update graph edge
+                            this.graph.forEachEdge((edge, attrs) => {
+                                if (attrs.edgeId === edgeId) {
+                                    this.graph.setEdgeAttribute(edge, 'traffic', this.trafficData[edgeId]);
+                                }
+                            });
+                            
+                            successCount++;
+                        }
+                    } catch (error) {
+                        // Silent fail for individual streets
+                    }
+                    
+                    // Update progress
+                    if (totalStreets % 10 === 0) {
+                        this.updateStatus(`Loading traffic: ${totalStreets}/${Object.keys(this.streetLayers).length}...`, true);
+                    }
+                }
+                
+                this.updateTrafficVisualization();
+                this.updateLegendForTraffic();
+                this.updateStatus(`✅ Loaded traffic data (${successCount}/${totalStreets} streets)`);
+            }
+            
+            updateTrafficVisualization() {
+                for (const [edgeId, layer] of Object.entries(this.streetLayers)) {
+                    const traffic = this.trafficData[edgeId];
+                    
+                    if (traffic) {
+                        const congestion = this.calculateCongestion(traffic);
+                        layer.setStyle({
+                            color: congestion.color,
+                            weight: 4,
+                            opacity: 0.8
+                        });
+                        
+                        // Update popup
+                        const oldPopup = layer.getPopup();
+                        if (oldPopup) {
+                            const content = oldPopup.getContent() + `
+                                <br><strong>Traffic:</strong>
+                                <br>Current: ${traffic.currentSpeed} km/h
+                                <br>Free Flow: ${traffic.freeFlowSpeed} km/h
+                                <br>Congestion: ${congestion.percentage}%
+                            `;
+                            layer.setPopupContent(content);
+                        }
+                    }
+                }
+            }
+            
+            calculateCongestion(flowData) {
+                const ratio = flowData.currentSpeed / flowData.freeFlowSpeed;
+                const congestionPercent = Math.round((1 - ratio) * 100);
+                
+                let color;
+                if (ratio > 0.8) color = '#22C55E'; // Free flow - green
+                else if (ratio > 0.6) color = '#FACC15'; // Light - yellow
+                else if (ratio > 0.4) color = '#FB923C'; // Moderate - orange
+                else if (ratio > 0.2) color = '#EF4444'; // Heavy - red
+                else color = '#991B1B'; // Severe - dark red
+                
+                return { color, percentage: Math.max(0, congestionPercent) };
+            }
+            
+            updateLegendForTraffic() {
+                document.getElementById('legendTitle').textContent = 'Traffic Levels:';
+                document.getElementById('legend1').textContent = 'Free Flow';
+                document.getElementById('legend2').textContent = 'Light';
+                document.getElementById('legend3').textContent = 'Moderate';
+                document.getElementById('legend4').textContent = 'Heavy';
+                document.getElementById('legend5').textContent = 'Severe';
+                
+                document.querySelector('.legend-item:nth-child(2) .legend-color').style.background = '#22C55E';
+                document.querySelector('.legend-item:nth-child(3) .legend-color').style.background = '#FACC15';
+                document.querySelector('.legend-item:nth-child(4) .legend-color').style.background = '#FB923C';
+                document.querySelector('.legend-item:nth-child(5) .legend-color').style.background = '#EF4444';
+                document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#991B1B';
             }
         }
         
