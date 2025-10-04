@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Urban Traffic Analyzer (Concise)</title>
+<title>Urban Traffic Analyzer</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
 <style>
@@ -11,12 +11,10 @@
   #map{height:100vh}
   .panel{position:absolute;top:16px;right:16px;background:#fff;padding:16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.15);z-index:1000;width:300px;max-height:90vh;overflow:auto}
   .panel h3{margin:0 0 8px}
-  .panel .hint{font-size:12px;background:#E3F2FD;color:#1976D2;padding:8px;border-radius:4px;margin-bottom:8px}
-  .btn, select{width:100%;padding:10px;margin:6px 0;border:none;border-radius:6px;background:#4CAF50;color:#fff;cursor:pointer}
+  .hint{font-size:12px;background:#E3F2FD;color:#1976D2;padding:8px;border-radius:4px;margin-bottom:8px}
+  .btn,select{width:100%;padding:10px;margin:6px 0;border:none;border-radius:6px;background:#4CAF50;color:#fff;cursor:pointer}
   .btn:disabled{background:#ccc;cursor:not-allowed}
-  .btn.secondary{background:#000}
-  .btn.warn{background:#FF9800}
-  .btn.danger{background:#f44336}
+  .btn.secondary{background:#000}.btn.warn{background:#FF9800}.btn.danger{background:#f44336}
   .status{background:#f7f7f7;padding:8px;border-radius:4px;font-size:12px;margin-top:8px}
   .legend{margin-top:10px;background:#f9f9f9;padding:8px;border-radius:4px;font-size:12px}
   .legend-item{display:flex;align-items:center;margin:4px 0}
@@ -32,9 +30,9 @@
 
 <div class="panel">
   <h3>🚦 Traffic Analyzer</h3>
-  <div class="hint">Draw a polygon on the map, then click “Load Street Network”.</div>
+  <div class="hint">Draw a polygon or use current map view, then click “Load Street Network”.</div>
 
-  <button id="btnLoad" class="btn" disabled>Load Street Network</button>
+  <button id="btnLoad" class="btn">Load Street Network</button>
 
   <label style="font-size:12px;color:#555;margin-top:6px">Traffic Period</label>
   <select id="selPeriod" disabled>
@@ -62,7 +60,7 @@
   <button id="btnReset" class="btn warn" disabled>Reset Closures</button>
   <button id="btnClear" class="btn danger">Clear All</button>
 
-  <div id="status" class="status">Draw a polygon to get started.</div>
+  <div id="status" class="status">Ready. Draw a polygon or just load current bounds.</div>
   <div id="stats" class="stats" style="display:none">
     <strong>Network Stats</strong>
     <div id="nodes">Nodes: 0</div>
@@ -82,22 +80,25 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script src="https://unpkg.com/graphology/dist/graphology.umd.js"></script>
+<script src="https://unpkg.com/graphology-metrics/dist/graphology-metrics.min.js"></script>
 <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
 
 <script>
 class TrafficAnalyzer {
   constructor() {
     this.map=null; this.drawn=null; this.poly=null;
-    this.graph=new graphology.Graph({type:'directed'}); // two-way ways get both dirs
+    this.graph=new graphology.Graph({type:'directed'}); // two-way ways -> both directions
     this.originalGraph=null;
 
-    this.nodesById={};        // osm nodeId -> {lat,lon}
-    this.ways={};             // wayId -> {name,highway,maxspeed,coords:[latlng],nodeIds:[]}
-    this.edgesByWay={};       // wayId -> [edgeKeys]
-    this.layers={};           // wayId -> Leaflet Polyline
+    this.nodesById={};     // osm nodeId -> {lat,lon}
+    this.ways={};          // wayId -> {name,highway,maxspeed,coords:[latlng],nodeIds:[],lenKm}
+    this.edgesByWay={};    // wayId -> [edgeKeys]
+    this.layers={};        // wayId -> Leaflet Polyline
+
+    this.baseTraffic={};   // wayId -> {current,free,confidence}
+    this.traffic={};       // mutable traffic (period + closures applied)
+    this.importance={};    // wayId -> 0..100
     this.closedWays=new Set();
-    this.trafficByWay={};     // wayId -> {current,free,confidence}
-    this.importanceByWay={};  // wayId -> 0..100
 
     this.closeMode=false;
     this.viewMode='roadtype';
@@ -108,56 +109,61 @@ class TrafficAnalyzer {
   async init(){
     this.map=L.map('map').setView(this.center,this.zoom);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(this.map);
-
     this.drawn=new L.FeatureGroup().addTo(this.map);
-    const drawCtl=new L.Control.Draw({
-      draw:{polygon:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},rectangle:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},polyline:false,marker:false,circle:false,circlemarker:false},
-      edit:{featureGroup:this.drawn,remove:true}
-    }); this.map.addControl(drawCtl);
-
-    this.map.on(L.Draw.Event.CREATED,(e)=>{ this.drawn.clearLayers(); this.poly=e.layer; this.drawn.addLayer(this.poly); Q('#btnLoad').disabled=false; this.status('Polygon ready. Click “Load Street Network”.'); });
-    this.map.on(L.Draw.Event.DELETED,()=>{ this.poly=null; Q('#btnLoad').disabled=true; this.status('Draw a polygon to get started.'); });
+    const drawCtl=new L.Control.Draw({draw:{polygon:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},rectangle:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},polyline:false,marker:false,circle:false,circlemarker:false},edit:{featureGroup:this.drawn,remove:true}});
+    this.map.addControl(drawCtl);
+    this.map.on(L.Draw.Event.CREATED,(e)=>{ this.drawn.clearLayers(); this.poly=e.layer; this.drawn.addLayer(this.poly); this.status('Polygon ready. You can load streets now.'); });
+    this.map.on(L.Draw.Event.DELETED,()=>{ this.poly=null; this.status('Polygon removed. You can load current map bounds.'); });
 
     Q('#btnLoad').onclick=()=>this.loadOSM();
     Q('#btnClear').onclick=()=>this.clearAll();
     Q('#selPeriod').onchange=(e)=>e.target.value&&this.loadTraffic(e.target.value);
-    Q('#btnImportance').onclick=()=>this.calcImportance();
+    Q('#btnImportance').onclick=()=>this.calculateImportance();
     Q('#selView').onchange=(e)=>this.setView(e.target.value);
     Q('#btnReset').onclick=()=>this.resetClosures();
-    Q('#btnCloseMode').onclick=()=>this.toggleCloseMode(true);
+    Q('#btnCloseMode').onclick=()=>this.toggleCloseMode();
 
-    this.status('Draw a polygon to get started.');
+    this.status('Ready. Draw a polygon or just click “Load Street Network” to use map bounds.');
   }
 
+  // UI helpers
   status(msg,loading=false){ Q('#status').innerHTML=loading?`<b style="color:#4CAF50">${msg}</b>`:msg; }
+  updateLegendRoad(){ Q('#lgTitle').textContent='Road Types:'; S('#lg1','#FF4444','Motorway'); S('#lg2','#FF8800','Primary'); S('#lg3','#FFB700','Secondary'); S('#lg4','#4CAF50','Residential'); S('#lg5','#888','Other'); }
+  updateLegendTraffic(){ Q('#lgTitle').textContent='Traffic Levels:'; S('#lg1','#22C55E','Free Flow'); S('#lg2','#FACC15','Light'); S('#lg3','#FB923C','Moderate'); S('#lg4','#EF4444','Heavy'); S('#lg5','#991B1B','Severe'); }
+  updateLegendImportance(){ Q('#lgTitle').textContent='Importance:'; S('#lg1','#DC2626','Critical (80-100)'); S('#lg2','#F97316','Very Important (60-80)'); S('#lg3','#FACC15','Important (40-60)'); S('#lg4','#4ADE80','Moderate (20-40)'); S('#lg5','#60A5FA','Low (0-20)'); }
   roadColor(h){ const c={motorway:'#FF4444',motorway_link:'#FF4444',trunk:'#FF6644',trunk_link:'#FF6644',primary:'#FF8800',primary_link:'#FF8800',secondary:'#FFB700',secondary_link:'#FFB700',tertiary:'#FFDD00',residential:'#4CAF50',living_street:'#4CAF50',unclassified:'#999'}; return c[h]||'#888'; }
   roadWeight(h){ const w={motorway:4,trunk:4,primary:3,secondary:2,tertiary:2,residential:1.8,unclassified:1.6}; return w[h]||1.6; }
   congestionColor(r){ return r>0.8?'#22C55E':r>0.6?'#FACC15':r>0.4?'#FB923C':r>0.2?'#EF4444':'#991B1B'; }
   importanceColor(s){ return s>80?'#DC2626':s>60?'#F97316':s>40?'#FACC15':s>20?'#4ADE80':'#60A5FA'; }
+  rank(s){ return s>80?'Critical':s>60?'Very Important':s>40?'Important':s>20?'Moderate':'Low'; }
 
   async loadOSM(){
-    if(!this.poly) return alert('Draw polygon first.');
     this.resetState(true);
-    this.status('Loading street network…',true); Q('#btnLoad').disabled=true;
+    this.status('Loading street network…',true);
 
-    const latlngs=this.poly.getLatLngs()[0]; if(!latlngs||!latlngs.length){ this.status('Invalid polygon.'); Q('#btnLoad').disabled=false; return; }
-    const polyStr=latlngs.map(ll=>`${ll.lat} ${ll.lng}`).join(' ');
-    const query=`[out:json][timeout:60];
-      (way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](poly:"${polyStr}"););
-      out body;>;out skel qt;`;
+    // Polygon query if present; else use map bounds
+    let query;
+    if(this.poly){
+      const latlngs=this.poly.getLatLngs()[0]; if(!latlngs?.length){ this.status('Invalid polygon.'); return; }
+      const polyStr=latlngs.map(ll=>`${ll.lat} ${ll.lng}`).join(' ');
+      query=`[out:json][timeout:60];(way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](poly:"${polyStr}"););out body;>;out skel qt;`;
+    } else {
+      const b=this.map.getBounds(); const bbox=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()].join(',');
+      query=`[out:json][timeout:60];way["highway"]["highway"!~"footway|path|cycleway|steps|pedestrian|service"](${bbox});(._;>;);out;`;
+    }
 
     try{
       const {data}=await axios.post('https://overpass-api.de/api/interpreter',query,{headers:{'Content-Type':'text/plain'}});
-      const elements=data.elements||[];
-      elements.forEach(e=>{ if(e.type==='node') this.nodesById[e.id]={lat:e.lat,lon:e.lon}; });
-      elements.forEach(e=>{
-        if(e.type==='way'&&e.tags&&e.tags.highway&&e.nodes?.length>1){
+      const els=data.elements||[];
+      els.forEach(e=>{ if(e.type==='node') this.nodesById[e.id]={lat:e.lat,lon:e.lon}; });
+      els.forEach(e=>{
+        if(e.type==='way'&&e.tags?.highway&&e.nodes?.length>1){
           const coords=e.nodes.map(id=>this.nodesById[id]).filter(Boolean).map(n=>[n.lat,n.lon]);
           if(coords.length<2) return;
-          this.ways[e.id]={wayId:e.id,name:e.tags.name||'Unnamed',highway:e.tags.highway,maxspeed:e.tags.maxspeed||'Unknown',coords, nodeIds:e.nodes.slice()};
+          this.ways[e.id]={wayId:e.id,name:e.tags.name||'Unnamed',highway:e.tags.highway,maxspeed:e.tags.maxspeed||'Unknown',coords,nodeIds:e.nodes.slice(),lenKm:this.lengthKm(coords)};
         }
       });
-      if(!Object.keys(this.ways).length){ this.status('No streets found. Try a larger area.'); Q('#btnLoad').disabled=false; return; }
+      if(!Object.keys(this.ways).length){ this.status('No streets found in this area.'); return; }
 
       this.buildCompressedGraph(); this.drawWays();
       this.originalGraph=this.graph.copy();
@@ -165,43 +171,30 @@ class TrafficAnalyzer {
       Q('#stats').style.display='block';
       Q('#nodes').textContent=`Nodes: ${this.graph.order}`;
       Q('#ways').textContent=`Streets: ${Object.keys(this.ways).length}`;
-
       ['#selPeriod','#btnImportance','#selView','#btnReset','#btnCloseMode'].forEach(s=>Q(s).disabled=false);
-      this.status(`✅ Loaded ${Object.keys(this.ways).length} streets`); Q('#btnLoad').disabled=false;
-    }catch(e){ console.error(e); this.status('Error loading street data. Try again.'); Q('#btnLoad').disabled=false; }
+      this.status(`✅ Loaded ${Object.keys(this.ways).length} streets`);
+    }catch(e){ console.error(e); this.status('Error loading street data. Try again.'); }
   }
 
   buildCompressedGraph(){
     this.graph.clear(); this.edgesByWay={};
-    // degree map (count neighbors across all ways)
     const deg={};
     Object.values(this.ways).forEach(w=>{
-      for(let i=0;i<w.nodeIds.length-1;i++){
-        const a=w.nodeIds[i], b=w.nodeIds[i+1];
-        deg[a]=(deg[a]||0)+1; deg[b]=(deg[b]||0)+1;
-      }
+      for(let i=0;i<w.nodeIds.length-1;i++){ const a=w.nodeIds[i], b=w.nodeIds[i+1]; deg[a]=(deg[a]||0)+1; deg[b]=(deg[b]||0)+1; }
     });
-
-    // add node if needed
     const addNode=(id)=>{ if(!this.graph.hasNode(id)){ const n=this.nodesById[id]; if(n) this.graph.addNode(id,{lat:n.lat,lon:n.lon}); } };
 
-    // compress along degree-2 chains
     Object.values(this.ways).forEach(w=>{
       this.edgesByWay[w.wayId]=[];
       const N=w.nodeIds.length; let i=0, seg=0;
+      const oneway = w.oneway==='yes' || w.highway?.includes('_link');
       while(i<N-1){
         let j=i+1; while(j<N-1 && (deg[w.nodeIds[j]]||0)===2) j++;
         const start=w.nodeIds[i], end=w.nodeIds[j];
         addNode(start); addNode(end);
-
-        // polyline coords for this compressed segment
-        const segCoords=[];
-        for(let k=i;k<=j;k++){ const n=this.nodesById[w.nodeIds[k]]; if(n) segCoords.push([n.lat,n.lon]); }
-
-        // add both directions unless oneway=yes
-        const oneway=(w.oneway==='yes'||w.oneway===true||w.oneway===1||w.highway?.includes('_link'));
-        const base={wayId:w.wayId,highway:w.highway,name:w.name,maxspeed:w.maxspeed,coords:segCoords};
-
+        const segCoords=[]; for(let k=i;k<=j;k++){ const n=this.nodesById[w.nodeIds[k]]; if(n) segCoords.push([n.lat,n.lon]); }
+        const lenKm=this.lengthKm(segCoords);
+        const base={wayId:w.wayId,highway:w.highway,name:w.name,maxspeed:w.maxspeed,coords:segCoords,lenKm};
         const keyF=`${w.wayId}:${seg}:f`, keyB=`${w.wayId}:${seg}:b`;
         this.graph.addEdgeWithKey(keyF,start,end,base);
         if(!oneway) this.graph.addEdgeWithKey(keyB,end,start,base);
@@ -216,45 +209,50 @@ class TrafficAnalyzer {
     Object.values(this.ways).forEach(w=>{
       const layer=L.polyline(w.coords,{color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75}).addTo(this.map);
       layer.bindPopup(this.popupHTML(w));
-      layer.on('click', (e)=> this.onWayClick(w.wayId, e));
+      layer.on('click',(e)=>this.onWayClick(w.wayId,e));
       this.layers[w.wayId]=layer;
     });
     this.updateLegendRoad();
   }
 
-  popupHTML(w, extra=''){
-    return `<div class="street-popup"><strong>${esc(w.name)}</strong><br>Type: ${esc(w.highway)}<br>Max Speed: ${esc(w.maxspeed)}<br>Way ID: ${w.wayId}${extra}</div>`;
-  }
-
   async loadTraffic(period){
-    this.status(`Loading ${period} traffic…`,true);
-    this.trafficByWay={};
-    let done=0, total=Object.keys(this.ways).length, ok=0;
-
-    for(const w of Object.values(this.ways)){
+    this.status(`Loading ${period} traffic (snapshot)…`,true);
+    this.baseTraffic={}; this.traffic={};
+    const ways=Object.values(this.ways); let done=0, ok=0;
+    for(const w of ways){
       const mid=w.coords[Math.floor(w.coords.length/2)];
       try{
         const url='https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json';
-        const {data}=await axios.get(url,{params:{key:this.tomtom,point:`${mid[0]},${mid[1]}`}}); // sequential -> gentle on API
+        const {data}=await axios.get(url,{params:{key:this.tomtom,point:`${mid[0]},${mid[1]}`}}); // one call per way
         if(data?.flowSegmentData){
           const f=data.flowSegmentData;
-          this.trafficByWay[w.wayId]={current:f.currentSpeed,free:f.freeFlowSpeed,confidence:f.confidence};
+          this.baseTraffic[w.wayId]={current:f.currentSpeed,free:f.freeFlowSpeed,confidence:f.confidence};
           ok++;
         }
       }catch(e){}
-      done++; if(done%10===0) this.status(`Traffic: ${done}/${total}…`,true);
+      done++; if(done%10===0) this.status(`Traffic: ${done}/${ways.length}…`,true);
     }
-    if(this.viewMode!=='traffic'){ Q('#selView').value='traffic'; this.viewMode='traffic'; }
-    this.renderTraffic(); this.updateLegendTraffic();
-    this.status(`✅ Traffic loaded (${ok}/${total})`);
+    this.applyPeriod(period);
+    this.viewMode='traffic'; Q('#selView').value='traffic'; this.renderTraffic(); this.updateLegendTraffic();
+    this.status(`✅ Traffic loaded (${ok}/${ways.length})`);
+  }
+
+  applyPeriod(period){
+    const factor = period==='morning'?0.75: period==='evening'?0.7: 1.05; // simple static snapshot scaling
+    this.traffic={};
+    Object.keys(this.ways).forEach(wid=>{
+      const b=this.baseTraffic[wid]; if(!b) return;
+      this.traffic[wid]={current:Math.max(5, Math.round(b.current*factor)), free:b.free, confidence:b.confidence};
+    });
+    this.recalcTrafficAfterClosures(); // reapply closures if any
   }
 
   renderTraffic(){
-    for(const [wayId, layer] of Object.entries(this.layers)){
-      const w=this.ways[wayId]; const t=this.trafficByWay[wayId];
+    for(const [wayId,layer] of Object.entries(this.layers)){
+      const w=this.ways[wayId]; const t=this.traffic[wayId];
       if(!w||!layer) continue;
       if(t){
-        const ratio = Math.max(0.01, t.current / Math.max(1, t.free));
+        const ratio=Math.max(0.01, t.current/Math.max(1,t.free));
         layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.9});
         layer.setPopupContent(this.popupHTML(w, `<br><strong>Traffic</strong><br>Current: ${t.current} km/h<br>Free: ${t.free} km/h<br>Congestion: ${Math.round((1-ratio)*100)}%`));
       } else {
@@ -263,10 +261,60 @@ class TrafficAnalyzer {
     }
   }
 
-  calcImportance(){
+  calculateImportance(){
     this.status('Calculating importance…',true);
-    // Unweighted betweenness (Brandes simplified, directed graph)
-    const nodes=this.graph.nodes(); const B={}; nodes.forEach(n=>B[n]=0);
+    // compute edge cost = travel_time * volume_factor using current traffic if available
+    this.graph.forEachEdge((k,a)=>{
+      const t=this.traffic[a.wayId]||this.baseTraffic[a.wayId];
+      const speed=Math.max(5,(t?.current)||50), free=Math.max(5,(t?.free)||speed);
+      const vol=1 + 0.6*Math.max(0,(free/speed)-1); // synthetic volume factor
+      const cost=(a.lenKm/ speed) * vol; // hours * volume
+      this.graph.setEdgeAttribute(k,'cost',cost);
+    });
+
+    // try graphology-metrics (weighted), else compact unweighted Brandes
+    let nodeC=null;
+    try{
+      if(window.graphologyMetrics?.centrality?.betweenness){
+        nodeC=window.graphologyMetrics.centrality.betweenness(this.graph,{weighted:'cost',normalized:true});
+      }
+    }catch(e){}
+    if(!nodeC) nodeC=this.betweennessUnweighted();
+
+    // per-way score = avg of endpoints’ centrality blended with congestion
+    const vals=[];
+    const wayTopo={};
+    Object.entries(this.edgesByWay).forEach(([wid,ek])=>{
+      let sum=0,cnt=0; ek.forEach(k=>{ if(this.graph.hasEdge(k)){ const u=this.graph.source(k), v=this.graph.target(k); sum+=((nodeC[u]||0)+(nodeC[v]||0))/2; cnt++; } });
+      wayTopo[wid]=cnt?sum/cnt:0; vals.push(wayTopo[wid]);
+    });
+    const min=Math.min(...vals,0), max=Math.max(...vals,1), rng=(max-min)||1;
+
+    this.importance={};
+    Object.keys(this.ways).forEach(wid=>{
+      const topo=((wayTopo[wid]-min)/rng); // 0..1
+      const t=this.traffic[wid]||this.baseTraffic[wid];
+      const cong=t?(1-Math.max(0,Math.min(1,(t.current/Math.max(1,t.free))))):0.2; // 0..1
+      const score=Math.round((0.6*topo + 0.4*cong)*100);
+      this.importance[wid]=score;
+    });
+
+    this.viewMode='importance'; Q('#selView').value='importance';
+    this.renderImportance(); this.updateLegendImportance();
+    this.status('✅ Importance calculated.');
+  }
+
+  renderImportance(){
+    Object.entries(this.layers).forEach(([wid,layer])=>{
+      const score=this.importance[wid]||0, w=this.ways[wid];
+      const opacity=0.5 + 0.5*(score/100);
+      layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity});
+      layer.setPopupContent(this.popupHTML(w, `<br><strong>Importance</strong><br>Score: ${score}/100 (${this.rank(score)})`));
+    });
+  }
+
+  betweennessUnweighted(){ // compact Brandes for directed graph
+    const nodes=this.graph.nodes(), B={}; nodes.forEach(n=>B[n]=0);
     nodes.forEach(s=>{
       const S=[], P={}, sigma={}, dist={};
       nodes.forEach(n=>{P[n]=[];sigma[n]=0;dist[n]=-1;});
@@ -286,64 +334,33 @@ class TrafficAnalyzer {
         if(w!==s) B[w]+=delta[w];
       }
     });
-
-    // Aggregate to ways: average of src/target centrality across that way’s edges, then normalize
-    const wayScores={}; const vals=[];
-    Object.entries(this.edgesByWay).forEach(([wayId,edgeKeys])=>{
-      let sum=0, cnt=0;
-      edgeKeys.forEach(k=>{
-        if(this.graph.hasEdge(k)){
-          const u=this.graph.source(k), v=this.graph.target(k);
-          sum += ((B[u]||0)+(B[v]||0))/2; cnt++;
-        }
-      });
-      const s=cnt?sum/cnt:0; wayScores[wayId]=s; vals.push(s);
-    });
-    const min=Math.min(...vals,0), max=Math.max(...vals,1), rng=(max-min)||1;
-    this.importanceByWay={}; Object.keys(wayScores).forEach(wid=>{
-      this.importanceByWay[wid]=Math.round(((wayScores[wid]-min)/rng)*100);
-    });
-
-    this.viewMode='importance'; Q('#selView').value='importance';
-    this.renderImportance(); this.updateLegendImportance();
-    this.status('✅ Importance calculated. Switch views anytime.');
+    // normalize 0..1 per standard (rough)
+    const vals=Object.values(B); const M=Math.max(...vals,1);
+    Object.keys(B).forEach(k=>B[k]=B[k]/M);
+    return B;
   }
-
-  renderImportance(){
-    Object.entries(this.layers).forEach(([wid,layer])=>{
-      const score=this.importanceByWay[wid]||0, w=this.ways[wid];
-      layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity:.9});
-      layer.setPopupContent(this.popupHTML(w, `<br><strong>Importance</strong><br>Score: ${score}/100 (${this.rank(score)})`));
-    });
-  }
-  rank(s){ return s>80?'Critical':s>60?'Very Important':s>40?'Important':s>20?'Moderate':'Low'; }
 
   setView(mode){
     this.viewMode=mode;
     if(mode==='roadtype'){ this.drawWays(); this.updateLegendRoad(); }
     else if(mode==='traffic'){
-      if(Object.keys(this.trafficByWay).length){ this.renderTraffic(); this.updateLegendTraffic(); }
+      if(Object.keys(this.baseTraffic).length){ this.renderTraffic(); this.updateLegendTraffic(); }
       else { alert('Load traffic data first'); Q('#selView').value='roadtype'; this.viewMode='roadtype'; this.updateLegendRoad(); }
-    }
-    else if(mode==='importance'){
-      if(Object.keys(this.importanceByWay).length){ this.renderImportance(); this.updateLegendImportance(); }
+    } else if(mode==='importance'){
+      if(Object.keys(this.importance).length){ this.renderImportance(); this.updateLegendImportance(); }
       else { alert('Calculate importance first'); Q('#selView').value='roadtype'; this.viewMode='roadtype'; this.updateLegendRoad(); }
     }
   }
 
-  updateLegendRoad(){ Q('#lgTitle').textContent='Road Types:'; S('#lg1','#FF4444','Motorway'); S('#lg2','#FF8800','Primary'); S('#lg3','#FFB700','Secondary'); S('#lg4','#4CAF50','Residential'); S('#lg5','#888','Other'); }
-  updateLegendTraffic(){ Q('#lgTitle').textContent='Traffic Levels:'; S('#lg1','#22C55E','Free Flow'); S('#lg2','#FACC15','Light'); S('#lg3','#FB923C','Moderate'); S('#lg4','#EF4444','Heavy'); S('#lg5','#991B1B','Severe'); }
-  updateLegendImportance(){ Q('#lgTitle').textContent='Importance:'; S('#lg1','#DC2626','Critical (80-100)'); S('#lg2','#F97316','Very Important (60-80)'); S('#lg3','#FACC15','Important (40-60)'); S('#lg4','#4ADE80','Moderate (20-40)'); S('#lg5','#60A5FA','Low (0-20)'); }
-
-  toggleCloseMode(forceArm){
-    this.closeMode = forceArm ? !this.closeMode : this.closeMode;
+  toggleCloseMode(){
+    this.closeMode=!this.closeMode;
     const b=Q('#btnCloseMode');
-    if(this.closeMode){ b.textContent='Click a street on the map to toggle closure (Click again to cancel)'; this.status('Simulation: Click a street to close or reopen it.'); b.style.background='#444'; }
-    else { b.textContent='Close/Reopen a Street'; this.status('Simulation mode off.'); b.style.background='#000'; }
+    if(this.closeMode){ b.textContent='Click a street to toggle closure (Click again to exit)'; b.style.background='#444'; this.status('Simulation armed: click a street to close/reopen.'); }
+    else { b.textContent='Close/Reopen a Street'; b.style.background='#000'; this.status('Simulation mode off.'); }
   }
 
-  onWayClick(wayId, e){
-    if(!this.closeMode) return; // Only act in close-mode
+  onWayClick(wayId){
+    if(!this.closeMode) return;
     if(this.closedWays.has(wayId)) this.reopenWay(wayId);
     else this.closeWay(wayId);
   }
@@ -351,110 +368,101 @@ class TrafficAnalyzer {
   closeWay(wayId){
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.add(wayId);
-    layer.setStyle({color:'#000',opacity:.6,weight:5,dashArray:'10,8'});
-    const el=layer.getElement?.(); if(el) el.classList.add('alt');
-
+    layer.setStyle({color:'#000',opacity:.65,weight:5,dashArray:'10,8'}); const el=layer.getElement?.(); if(el) el.classList.add('alt');
     // drop all edges of this way
     (this.edgesByWay[wayId]||[]).forEach(k=>{ if(this.graph.hasEdge(k)) this.graph.dropEdge(k); });
-
-    // find alternatives between way endpoints (first and last node of the way)
-    const w=this.ways[wayId];
-    const s=w.nodeIds[0], t=w.nodeIds[w.nodeIds.length-1];
-    const alts=this.findAlternatives(s,t,3);
-    this.redistributeTraffic(alts);
-    this.highlightAlternatives(alts);
-
-    this.status(`🚧 Closed: ${w.name}. Total closures: ${this.closedWays.size}. Click another street or turn off close mode.`);
+    // recompute traffic redistribution
+    this.recalcTrafficAfterClosures(true);
+    this.animateAlternatives(wayId);
+    this.status(`🚧 Closed: ${this.ways[wayId]?.name || wayId}. Total closures: ${this.closedWays.size}.`);
   }
 
   reopenWay(wayId){
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.delete(wayId);
-    const w=this.ways[wayId];
-    // restore style according to current view
-    if(this.viewMode==='traffic' && this.trafficByWay[wayId]){
-      const t=this.trafficByWay[wayId];
-      const ratio=Math.max(0.01,t.current/Math.max(1,t.free));
-      layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.9,dashArray:null});
-    } else if(this.viewMode==='importance' && this.importanceByWay[wayId]!=null){
-      const score=this.importanceByWay[wayId];
-      layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity:.9,dashArray:null});
-    } else {
-      layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75,dashArray:null});
-    }
+    const w=this.ways[wayId], t=this.traffic[wayId]||this.baseTraffic[wayId];
+    if(this.viewMode==='traffic' && t){
+      const r=Math.max(0.01,(t.current/Math.max(1,t.free)));
+      layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.9,dashArray:null});
+    } else if(this.viewMode==='importance' && this.importance[wayId]!=null){
+      const s=this.importance[wayId]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.9,dashArray:null});
+    } else layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75,dashArray:null});
     const el=layer.getElement?.(); if(el) el.classList.remove('alt');
-
-    // re-add edges of this way from originalGraph
-    this.originalGraph.forEachEdge((key,attrs,src,tgt)=>{
-      if(attrs.wayId===wayId && !this.graph.hasEdge(key)){ this.graph.addEdgeWithKey(key,src,tgt,attrs); }
-    });
+    // re-add original edges for this way
+    this.originalGraph.forEachEdge((key,attrs,src,tgt)=>{ if(attrs.wayId===wayId && !this.graph.hasEdge(key)) this.graph.addEdgeWithKey(key,src,tgt,attrs); });
+    this.recalcTrafficAfterClosures(true);
     this.status(`Reopened: ${w.name}. Total closures: ${this.closedWays.size}.`);
   }
 
+  recalcTrafficAfterClosures(repaint=false){
+    // reset to base or applied period if present
+    const base = Object.keys(this.traffic).length ? this.traffic : this.baseTraffic;
+    const fresh={}; Object.keys(base).forEach(k=>fresh[k]={...base[k]}); // clone
+    // for each closed way, find alternatives and add pressure
+    this.closedWays.forEach(wid=>{
+      const w=this.ways[wid]; if(!w) return;
+      const s=w.nodeIds[0], t=w.nodeIds[w.nodeIds.length-1];
+      const alts=this.findAlternatives(s,t,3);
+      // estimate demand from closed way
+      const b=this.baseTraffic[wid]||{current:30,free:50}; const demand = w.lenKm * (b.free/Math.max(5,b.current)); // rough demand unit
+      // distribute across alternative edges by length share
+      const wayShare={};
+      alts.forEach(edges=>{
+        let totalLen=0; edges.forEach(k=>{ const a=this.graph.getEdgeAttributes(k); totalLen+=a.lenKm||0.05; });
+        edges.forEach(k=>{
+          const a=this.graph.getEdgeAttributes(k); const w2=a.wayId; const share=(a.lenKm||0.05)/Math.max(0.05,totalLen);
+          wayShare[w2]=(wayShare[w2]||0)+demand*share/alts.length;
+        });
+      });
+      // apply impact: reduce current speed based on added pressure
+      Object.entries(wayShare).forEach(([w2,pressure])=>{
+        const t=fresh[w2]; if(!t) return;
+        const factor = 1/(1+0.25*pressure); // slower with more pressure
+        t.current=Math.max(5,Math.round(t.current*factor));
+      });
+    });
+    this.traffic=fresh;
+    if(repaint && this.viewMode==='traffic') this.renderTraffic();
+  }
+
   findAlternatives(source,target,maxPaths=3){
-    const paths=[]; const q=[[source]]; const seen=new Set([source]); const MAXLEN=10;
+    const paths=[]; const q=[[source]]; const MAXLEN=10;
     while(q.length && paths.length<maxPaths){
       const p=q.shift(); const v=p[p.length-1];
       if(v===target && p.length>1){ paths.push(p); continue; }
       if(p.length>MAXLEN) continue;
-      this.graph.outNeighbors(v).forEach(n=>{
-        if(!p.includes(n)) q.push([...p,n]);
-      });
+      this.graph.outNeighbors(v).forEach(n=>{ if(!p.includes(n)) q.push([...p,n]); });
     }
-    // convert to edge lists
-    return paths.map(p=>{
-      const edges=[]; for(let i=0;i<p.length-1;i++){ const k=this.graph.edge(p[i],p[i+1]); if(k) edges.push(k); }
-      return edges;
-    }).filter(e=>e.length);
+    return paths.map(p=>{ const edges=[]; for(let i=0;i<p.length-1;i++){ const k=this.graph.edge(p[i],p[i+1]); if(k) edges.push(k); } return edges; }).filter(e=>e.length);
   }
 
-  redistributeTraffic(alts){
-    if(!alts.length) return;
-    // simplistic: increase weight on alt edges slightly
-    alts.forEach(es=>{
-      es.forEach(k=>{
-        const w=(this.graph.getEdgeAttribute(k,'weight')||1)+0.5;
-        this.graph.setEdgeAttribute(k,'weight',w);
-      });
-    });
-  }
-
-  highlightAlternatives(alts){
-    // highlight by way polyline color briefly
-    const highlighted=new Set();
+  animateAlternatives(closedWayId){
+    const w=this.ways[closedWayId], s=w.nodeIds[0], t=w.nodeIds[w.nodeIds.length-1];
+    const alts=this.findAlternatives(s,t,3); const highlighted=new Set();
     alts.forEach((es,i)=>{
       es.forEach(k=>{
-        const a=this.graph.getEdgeAttributes(k); const wayId=a.wayId;
-        if(wayId && this.layers[wayId] && !this.closedWays.has(wayId) && !highlighted.has(wayId)){
-          highlighted.add(wayId);
-          const layer=this.layers[wayId];
-          const old=layer.options.color;
-          setTimeout(()=>layer.setStyle({color:'#FF6B6B',weight:5,opacity:.95}), i*150);
-          setTimeout(()=>{
-            if(!this.closedWays.has(wayId)){
-              if(this.viewMode==='importance' && this.importanceByWay[wayId]!=null){
-                const score=this.importanceByWay[wayId];
-                layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity:.9});
-              } else if(this.viewMode==='traffic' && this.trafficByWay[wayId]){
-                const t=this.trafficByWay[wayId]; const r=Math.max(0.01,t.current/Math.max(1,t.free));
-                layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.9});
-              } else {
-                const w=this.ways[wayId];
-                layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75});
-              }
-            }
-          }, 2500+i*150);
-        }
+        const a=this.graph.getEdgeAttributes(k); const wid=a.wayId; if(!wid||this.closedWays.has(wid)||highlighted.has(wid)) return;
+        highlighted.add(wid); const layer=this.layers[wid]; if(!layer) return;
+        setTimeout(()=>layer.setStyle({color:'#FF6B6B',weight:5,opacity:.95}), i*150);
+        setTimeout(()=>{ if(!this.closedWays.has(wid)){ // revert per current view
+          if(this.viewMode==='traffic' && this.traffic[wid]){
+            const t=this.traffic[wid]; const r=Math.max(0.01,t.current/Math.max(1,t.free));
+            layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.9});
+          } else if(this.viewMode==='importance' && this.importance[wid]!=null){
+            const s=this.importance[wid]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.9});
+          } else {
+            const ww=this.ways[wid]; layer.setStyle({color:this.roadColor(ww.highway),weight:this.roadWeight(ww.highway),opacity:.75});
+          }
+        }}, 2500+i*150);
       });
     });
   }
 
   resetClosures(){
-    // reopen all
     Array.from(this.closedWays).forEach(wid=>this.reopenWay(wid));
     this.closedWays.clear();
     this.graph=this.originalGraph.copy();
-    this.setView(this.viewMode);
+    this.recalcTrafficAfterClosures(true);
     this.status('✅ All closures reset.');
   }
 
@@ -462,18 +470,26 @@ class TrafficAnalyzer {
     if(this.drawn) this.drawn.clearLayers();
     Object.values(this.layers).forEach(l=>this.map.removeLayer(l)); this.layers={};
     this.resetState(false);
-    this.status('Cleared. Draw a polygon to start.'); Q('#btnLoad').disabled=false;
+    this.status('Cleared. Draw a polygon or load current map bounds.');
   }
 
   resetState(disableButtons){
-    this.nodesById={}; this.ways={}; this.edgesByWay={}; this.closedWays.clear();
-    this.trafficByWay={}; this.importanceByWay={};
-    this.graph.clear(); this.originalGraph=null; this.viewMode='roadtype'; Q('#selView').value='roadtype';
+    this.nodesById={}; this.ways={}; this.edgesByWay={};
+    this.baseTraffic={}; this.traffic={}; this.importance={};
+    this.closedWays.clear();
+    this.graph.clear(); this.originalGraph=null;
+    this.viewMode='roadtype'; Q('#selView').value='roadtype';
     ['#selPeriod','#btnImportance','#selView','#btnReset','#btnCloseMode'].forEach(s=>Q(s).disabled=disableButtons);
     Q('#stats').style.display='none';
   }
+
+  // Utilities
+  popupHTML(w,extra=''){ return `<div class="street-popup"><strong>${esc(w.name)}</strong><br>Type: ${esc(w.highway)}<br>Max Speed: ${esc(w.maxspeed)}<br>Way ID: ${w.wayId}${extra}</div>`; }
+  lengthKm(coords){ let d=0; for(let i=0;i<coords.length-1;i++) d+=this.haversine(coords[i],coords[i+1]); return d; }
+  haversine(a,b){ const R=6371, toRad=x=>x*Math.PI/180, dLat=toRad(b[0]-a[0]), dLon=toRad(b[1]-a[1]); const s1=Math.sin(dLat/2), s2=Math.sin(dLon/2); const q=s1*s1+Math.cos(toRad(a[0]))*Math.cos(toRad(b[0]))*s2*s2; return 2*R*Math.asin(Math.sqrt(q)); }
 }
 
+// DOM helpers
 function Q(s){ return document.querySelector(s); }
 function S(id,color,label){ Q(id).style.background=color; Q(id).parentElement.lastChild.nodeValue=' '+label; }
 function esc(s){ return String(s??'').replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
