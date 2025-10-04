@@ -21,7 +21,10 @@
   .legend-color{width:30px;height:3px;margin-right:8px}
   .stats{margin-top:8px;background:#E8F5E9;padding:8px;border-radius:4px;font-size:12px}
   .street-popup{font-size:12px}
-  .alt{animation:pulse 1.8s ease-in-out infinite}
+  /* Animations */
+  .closed{animation:flash 1.2s ease-in-out infinite}
+  @keyframes flash{0%,100%{opacity:.55}50%{opacity:1}}
+  .altPulse{animation:pulse 1.8s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
 </style>
 </head>
@@ -60,7 +63,7 @@
   <button id="btnReset" class="btn warn" disabled>Reset Closures</button>
   <button id="btnClear" class="btn danger">Clear All</button>
 
-  <div id="status" class="status">Ready. Draw a polygon or just load current bounds.</div>
+  <div id="status" class="status">Ready. Draw a polygon or load current bounds.</div>
   <div id="stats" class="stats" style="display:none">
     <strong>Network Stats</strong>
     <div id="nodes">Nodes: 0</div>
@@ -87,21 +90,12 @@
 class TrafficAnalyzer {
   constructor() {
     this.map=null; this.drawn=null; this.poly=null;
-    this.graph=new graphology.Graph({type:'directed'}); // two-way ways -> both directions
+    this.graph=new graphology.Graph({type:'directed'});
     this.originalGraph=null;
 
-    this.nodesById={};     // osm nodeId -> {lat,lon}
-    this.ways={};          // wayId -> {name,highway,maxspeed,coords:[latlng],nodeIds:[],lenKm}
-    this.edgesByWay={};    // wayId -> [edgeKeys]
-    this.layers={};        // wayId -> Leaflet Polyline
-
-    this.baseTraffic={};   // wayId -> {current,free,confidence}
-    this.traffic={};       // mutable traffic (period + closures applied)
-    this.importance={};    // wayId -> 0..100
-    this.closedWays=new Set();
-
-    this.closeMode=false;
-    this.viewMode='roadtype';
+    this.nodesById={}; this.ways={}; this.edgesByWay={}; this.layers={};
+    this.baseTraffic={}; this.traffic={}; this.importance={}; this.closedWays=new Set();
+    this.closeMode=false; this.viewMode='roadtype'; this.currentPeriod='';
     this.tomtom='2hRMy8jfLxTGLUhZ3UJNoqAlihmLd9PA';
     this.center=[44.8378,-0.5792]; this.zoom=14;
   }
@@ -112,18 +106,18 @@ class TrafficAnalyzer {
     this.drawn=new L.FeatureGroup().addTo(this.map);
     const drawCtl=new L.Control.Draw({draw:{polygon:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},rectangle:{shapeOptions:{color:'#2196F3',fillOpacity:.2}},polyline:false,marker:false,circle:false,circlemarker:false},edit:{featureGroup:this.drawn,remove:true}});
     this.map.addControl(drawCtl);
-    this.map.on(L.Draw.Event.CREATED,(e)=>{ this.drawn.clearLayers(); this.poly=e.layer; this.drawn.addLayer(this.poly); this.status('Polygon ready. You can load streets now.'); });
-    this.map.on(L.Draw.Event.DELETED,()=>{ this.poly=null; this.status('Polygon removed. You can load current map bounds.'); });
+    this.map.on(L.Draw.Event.CREATED,(e)=>{ this.drawn.clearLayers(); this.poly=e.layer; this.drawn.addLayer(this.poly); this.status('Polygon ready.'); });
+    this.map.on(L.Draw.Event.DELETED,()=>{ this.poly=null; this.status('Polygon removed. You can load current bounds.'); });
 
     Q('#btnLoad').onclick=()=>this.loadOSM();
     Q('#btnClear').onclick=()=>this.clearAll();
-    Q('#selPeriod').onchange=(e)=>e.target.value&&this.loadTraffic(e.target.value);
+    Q('#selPeriod').onchange=(e)=>{ if(e.target.value){ this.currentPeriod=e.target.value; this.loadTraffic(e.target.value);} };
     Q('#btnImportance').onclick=()=>this.calculateImportance();
     Q('#selView').onchange=(e)=>this.setView(e.target.value);
     Q('#btnReset').onclick=()=>this.resetClosures();
     Q('#btnCloseMode').onclick=()=>this.toggleCloseMode();
 
-    this.status('Ready. Draw a polygon or just click “Load Street Network” to use map bounds.');
+    this.status('Ready. Draw a polygon or click “Load Street Network”.');
   }
 
   // UI helpers
@@ -141,7 +135,6 @@ class TrafficAnalyzer {
     this.resetState(true);
     this.status('Loading street network…',true);
 
-    // Polygon query if present; else use map bounds
     let query;
     if(this.poly){
       const latlngs=this.poly.getLatLngs()[0]; if(!latlngs?.length){ this.status('Invalid polygon.'); return; }
@@ -160,14 +153,13 @@ class TrafficAnalyzer {
         if(e.type==='way'&&e.tags?.highway&&e.nodes?.length>1){
           const coords=e.nodes.map(id=>this.nodesById[id]).filter(Boolean).map(n=>[n.lat,n.lon]);
           if(coords.length<2) return;
-          this.ways[e.id]={wayId:e.id,name:e.tags.name||'Unnamed',highway:e.tags.highway,maxspeed:e.tags.maxspeed||'Unknown',coords,nodeIds:e.nodes.slice(),lenKm:this.lengthKm(coords)};
+          this.ways[e.id]={wayId:e.id,name:e.tags.name||'Unnamed',highway:e.tags.highway,maxspeed:e.tags.maxspeed||'Unknown',coords,nodeIds:e.nodes.slice(),lenKm:this.lengthKm(coords),oneway:e.tags.oneway==='yes'};
         }
       });
-      if(!Object.keys(this.ways).length){ this.status('No streets found in this area.'); return; }
+      if(!Object.keys(this.ways).length){ this.status('No streets found.'); return; }
 
       this.buildCompressedGraph(); this.drawWays();
       this.originalGraph=this.graph.copy();
-
       Q('#stats').style.display='block';
       Q('#nodes').textContent=`Nodes: ${this.graph.order}`;
       Q('#ways').textContent=`Streets: ${Object.keys(this.ways).length}`;
@@ -187,14 +179,14 @@ class TrafficAnalyzer {
     Object.values(this.ways).forEach(w=>{
       this.edgesByWay[w.wayId]=[];
       const N=w.nodeIds.length; let i=0, seg=0;
-      const oneway = w.oneway==='yes' || w.highway?.includes('_link');
+      const oneway = w.oneway || (w.highway?.includes('_link'));
       while(i<N-1){
         let j=i+1; while(j<N-1 && (deg[w.nodeIds[j]]||0)===2) j++;
         const start=w.nodeIds[i], end=w.nodeIds[j];
         addNode(start); addNode(end);
         const segCoords=[]; for(let k=i;k<=j;k++){ const n=this.nodesById[w.nodeIds[k]]; if(n) segCoords.push([n.lat,n.lon]); }
         const lenKm=this.lengthKm(segCoords);
-        const base={wayId:w.wayId,highway:w.highway,name:w.name,maxspeed:w.maxspeed,coords:segCoords,lenKm};
+        const base={wayId:w.wayId,highway:w.highway,name:w.name,maxspeed:w.maxspeed,coords:segCoords,lenKm,weight:1};
         const keyF=`${w.wayId}:${seg}:f`, keyB=`${w.wayId}:${seg}:b`;
         this.graph.addEdgeWithKey(keyF,start,end,base);
         if(!oneway) this.graph.addEdgeWithKey(keyB,end,start,base);
@@ -207,7 +199,7 @@ class TrafficAnalyzer {
   drawWays(){
     Object.values(this.layers).forEach(l=>this.map.removeLayer(l)); this.layers={};
     Object.values(this.ways).forEach(w=>{
-      const layer=L.polyline(w.coords,{color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75}).addTo(this.map);
+      const layer=L.polyline(w.coords,{color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85}).addTo(this.map);
       layer.bindPopup(this.popupHTML(w));
       layer.on('click',(e)=>this.onWayClick(w.wayId,e));
       this.layers[w.wayId]=layer;
@@ -217,7 +209,7 @@ class TrafficAnalyzer {
 
   async loadTraffic(period){
     this.status(`Loading ${period} traffic (snapshot)…`,true);
-    this.baseTraffic={}; this.traffic={};
+    this.baseTraffic={}; this.traffic={}; this.currentPeriod=period;
     const ways=Object.values(this.ways); let done=0, ok=0;
     for(const w of ways){
       const mid=w.coords[Math.floor(w.coords.length/2)];
@@ -238,13 +230,14 @@ class TrafficAnalyzer {
   }
 
   applyPeriod(period){
-    const factor = period==='morning'?0.75: period==='evening'?0.7: 1.05; // simple static snapshot scaling
-    this.traffic={};
+    const factor = period==='morning'?0.75: period==='evening'?0.7: 1.05;
+    const fresh={};
     Object.keys(this.ways).forEach(wid=>{
       const b=this.baseTraffic[wid]; if(!b) return;
-      this.traffic[wid]={current:Math.max(5, Math.round(b.current*factor)), free:b.free, confidence:b.confidence};
+      fresh[wid]={current:Math.max(5, Math.round(b.current*factor)), free:b.free, confidence:b.confidence};
     });
-    this.recalcTrafficAfterClosures(); // reapply closures if any
+    this.traffic=fresh;
+    this.recomputeNetworkLoadFromClosures(true);
   }
 
   renderTraffic(){
@@ -253,7 +246,7 @@ class TrafficAnalyzer {
       if(!w||!layer) continue;
       if(t){
         const ratio=Math.max(0.01, t.current/Math.max(1,t.free));
-        layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.9});
+        layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.95});
         layer.setPopupContent(this.popupHTML(w, `<br><strong>Traffic</strong><br>Current: ${t.current} km/h<br>Free: ${t.free} km/h<br>Congestion: ${Math.round((1-ratio)*100)}%`));
       } else {
         layer.setStyle({color:'#bbb',weight:3,opacity:.6});
@@ -263,40 +256,29 @@ class TrafficAnalyzer {
 
   calculateImportance(){
     this.status('Calculating importance…',true);
-    // compute edge cost = travel_time * volume_factor using current traffic if available
+    // edge cost = time*volume; seed from current traffic if available
     this.graph.forEachEdge((k,a)=>{
       const t=this.traffic[a.wayId]||this.baseTraffic[a.wayId];
       const speed=Math.max(5,(t?.current)||50), free=Math.max(5,(t?.free)||speed);
-      const vol=1 + 0.6*Math.max(0,(free/speed)-1); // synthetic volume factor
+      const vol=1 + 0.6*Math.max(0,(free/speed)-1);
       const cost=(a.lenKm/ speed) * vol; // hours * volume
       this.graph.setEdgeAttribute(k,'cost',cost);
     });
-
-    // try graphology-metrics (weighted), else compact unweighted Brandes
     let nodeC=null;
-    try{
-      if(window.graphologyMetrics?.centrality?.betweenness){
-        nodeC=window.graphologyMetrics.centrality.betweenness(this.graph,{weighted:'cost',normalized:true});
-      }
-    }catch(e){}
+    try{ if(window.graphologyMetrics?.centrality?.betweenness){ nodeC=window.graphologyMetrics.centrality.betweenness(this.graph,{weighted:'cost',normalized:true}); } }catch(e){}
     if(!nodeC) nodeC=this.betweennessUnweighted();
 
-    // per-way score = avg of endpoints’ centrality blended with congestion
-    const vals=[];
-    const wayTopo={};
+    const vals=[], wayTopo={};
     Object.entries(this.edgesByWay).forEach(([wid,ek])=>{
       let sum=0,cnt=0; ek.forEach(k=>{ if(this.graph.hasEdge(k)){ const u=this.graph.source(k), v=this.graph.target(k); sum+=((nodeC[u]||0)+(nodeC[v]||0))/2; cnt++; } });
       wayTopo[wid]=cnt?sum/cnt:0; vals.push(wayTopo[wid]);
     });
     const min=Math.min(...vals,0), max=Math.max(...vals,1), rng=(max-min)||1;
-
-    this.importance={};
-    Object.keys(this.ways).forEach(wid=>{
-      const topo=((wayTopo[wid]-min)/rng); // 0..1
+    this.importance={}; Object.keys(this.ways).forEach(wid=>{
+      const topo=((wayTopo[wid]-min)/rng);
       const t=this.traffic[wid]||this.baseTraffic[wid];
-      const cong=t?(1-Math.max(0,Math.min(1,(t.current/Math.max(1,t.free))))):0.2; // 0..1
-      const score=Math.round((0.6*topo + 0.4*cong)*100);
-      this.importance[wid]=score;
+      const cong=t?(1-Math.max(0,Math.min(1,(t.current/Math.max(1,t.free))))):0.2;
+      this.importance[wid]=Math.round((0.6*topo+0.4*cong)*100);
     });
 
     this.viewMode='importance'; Q('#selView').value='importance';
@@ -313,31 +295,23 @@ class TrafficAnalyzer {
     });
   }
 
-  betweennessUnweighted(){ // compact Brandes for directed graph
+  betweennessUnweighted(){
     const nodes=this.graph.nodes(), B={}; nodes.forEach(n=>B[n]=0);
     nodes.forEach(s=>{
       const S=[], P={}, sigma={}, dist={};
       nodes.forEach(n=>{P[n]=[];sigma[n]=0;dist[n]=-1;});
-      sigma[s]=1; dist[s]=0;
-      const Q=[s];
-      while(Q.length){
-        const v=Q.shift(); S.push(v);
+      sigma[s]=1; dist[s]=0; const Qq=[s];
+      while(Qq.length){
+        const v=Qq.shift(); S.push(v);
         this.graph.outNeighbors(v).forEach(w=>{
-          if(dist[w]<0){ Q.push(w); dist[w]=dist[v]+1; }
+          if(dist[w]<0){ Qq.push(w); dist[w]=dist[v]+1; }
           if(dist[w]===dist[v]+1){ sigma[w]+=sigma[v]; P[w].push(v); }
         });
       }
       const delta={}; nodes.forEach(n=>delta[n]=0);
-      while(S.length){
-        const w=S.pop();
-        P[w].forEach(v=>{ delta[v]+= (sigma[v]/Math.max(1,sigma[w]))*(1+delta[w]); });
-        if(w!==s) B[w]+=delta[w];
-      }
+      while(S.length){ const w=S.pop(); P[w].forEach(v=>{ delta[v]+= (sigma[v]/Math.max(1,sigma[w]))*(1+delta[w]); }); if(w!==s) B[w]+=delta[w]; }
     });
-    // normalize 0..1 per standard (rough)
-    const vals=Object.values(B); const M=Math.max(...vals,1);
-    Object.keys(B).forEach(k=>B[k]=B[k]/M);
-    return B;
+    const vals=Object.values(B); const M=Math.max(...vals,1); Object.keys(B).forEach(k=>B[k]=B[k]/M); return B;
   }
 
   setView(mode){
@@ -365,104 +339,160 @@ class TrafficAnalyzer {
     else this.closeWay(wayId);
   }
 
+  // CLOSED STREET: black dashed + flash; drop edges; redistribute traffic; animate alternatives
   closeWay(wayId){
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.add(wayId);
-    layer.setStyle({color:'#000',opacity:.65,weight:5,dashArray:'10,8'}); const el=layer.getElement?.(); if(el) el.classList.add('alt');
-    // drop all edges of this way
+    layer.setStyle({color:'#000',opacity:.95,weight:6,dashArray:'10,8'}); layer.bringToFront();
+    const el=layer.getElement?.(); if(el){ el.classList.add('closed'); el.classList.remove('altPulse'); }
+
+    // remove edges for this way
     (this.edgesByWay[wayId]||[]).forEach(k=>{ if(this.graph.hasEdge(k)) this.graph.dropEdge(k); });
-    // recompute traffic redistribution
-    this.recalcTrafficAfterClosures(true);
-    this.animateAlternatives(wayId);
+
+    // compute volume from closed way and redistribute
+    const volume=this.computeClosedVolume(wayId);
+    const {s,t}=this.wayEndpoints(wayId);
+    const alts=this.findAlternatives(s,t,3,5); // BFS: up to 3 paths, max 5 hops
+    this.redistributeTrafficVolume(volume, alts);
+
+    // animate alternatives (red pulsing)
+    this.animateAlternatives(alts);
+
+    // repaint traffic if visible
+    if(this.viewMode==='traffic') this.renderTraffic();
     this.status(`🚧 Closed: ${this.ways[wayId]?.name || wayId}. Total closures: ${this.closedWays.size}.`);
   }
 
   reopenWay(wayId){
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.delete(wayId);
-    const w=this.ways[wayId], t=this.traffic[wayId]||this.baseTraffic[wayId];
-    if(this.viewMode==='traffic' && t){
-      const r=Math.max(0.01,(t.current/Math.max(1,t.free)));
-      layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.9,dashArray:null});
-    } else if(this.viewMode==='importance' && this.importance[wayId]!=null){
-      const s=this.importance[wayId]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.9,dashArray:null});
-    } else layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.75,dashArray:null});
-    const el=layer.getElement?.(); if(el) el.classList.remove('alt');
-    // re-add original edges for this way
+    const w=this.ways[wayId];
+    layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85,dashArray:null});
+    const el=layer.getElement?.(); if(el){ el.classList.remove('closed'); el.classList.remove('altPulse'); }
+
+    // re-add original edges
     this.originalGraph.forEachEdge((key,attrs,src,tgt)=>{ if(attrs.wayId===wayId && !this.graph.hasEdge(key)) this.graph.addEdgeWithKey(key,src,tgt,attrs); });
-    this.recalcTrafficAfterClosures(true);
+
+    // recompute network load from remaining closures (resets weights and re-applies)
+    this.recomputeNetworkLoadFromClosures(true);
     this.status(`Reopened: ${w.name}. Total closures: ${this.closedWays.size}.`);
   }
 
-  recalcTrafficAfterClosures(repaint=false){
-    // reset to base or applied period if present
-    const base = Object.keys(this.traffic).length ? this.traffic : this.baseTraffic;
-    const fresh={}; Object.keys(base).forEach(k=>fresh[k]={...base[k]}); // clone
-    // for each closed way, find alternatives and add pressure
-    this.closedWays.forEach(wid=>{
-      const w=this.ways[wid]; if(!w) return;
-      const s=w.nodeIds[0], t=w.nodeIds[w.nodeIds.length-1];
-      const alts=this.findAlternatives(s,t,3);
-      // estimate demand from closed way
-      const b=this.baseTraffic[wid]||{current:30,free:50}; const demand = w.lenKm * (b.free/Math.max(5,b.current)); // rough demand unit
-      // distribute across alternative edges by length share
-      const wayShare={};
-      alts.forEach(edges=>{
-        let totalLen=0; edges.forEach(k=>{ const a=this.graph.getEdgeAttributes(k); totalLen+=a.lenKm||0.05; });
-        edges.forEach(k=>{
-          const a=this.graph.getEdgeAttributes(k); const w2=a.wayId; const share=(a.lenKm||0.05)/Math.max(0.05,totalLen);
-          wayShare[w2]=(wayShare[w2]||0)+demand*share/alts.length;
-        });
-      });
-      // apply impact: reduce current speed based on added pressure
-      Object.entries(wayShare).forEach(([w2,pressure])=>{
-        const t=fresh[w2]; if(!t) return;
-        const factor = 1/(1+0.25*pressure); // slower with more pressure
-        t.current=Math.max(5,Math.round(t.current*factor));
-      });
-    });
+  recomputeNetworkLoadFromClosures(repaint=false){
+    // reset edge weights
+    this.graph.forEachEdge((k,a)=>this.graph.setEdgeAttribute(k,'weight',1));
+    // reset traffic to current period/base
+    const fresh={}; const src = Object.keys(this.traffic).length? this.traffic : this.baseTraffic;
+    Object.keys(src).forEach(wid=>{ fresh[wid]={...src[wid]}; });
     this.traffic=fresh;
+
+    // apply all closures again
+    this.closedWays.forEach(wid=>{
+      const vol=this.computeClosedVolume(wid);
+      const {s,t}=this.wayEndpoints(wid);
+      const alts=this.findAlternatives(s,t,3,5);
+      this.redistributeTrafficVolume(vol, alts);
+    });
     if(repaint && this.viewMode==='traffic') this.renderTraffic();
   }
 
-  findAlternatives(source,target,maxPaths=3){
-    const paths=[]; const q=[[source]]; const MAXLEN=10;
+  // 2) Alternative Route Finding: BFS up to maxPaths, avoids closed (edges dropped), maxHops
+  findAlternatives(source,target,maxPaths=3,maxHops=5){
+    const paths=[]; const q=[[source]];
     while(q.length && paths.length<maxPaths){
       const p=q.shift(); const v=p[p.length-1];
       if(v===target && p.length>1){ paths.push(p); continue; }
-      if(p.length>MAXLEN) continue;
-      this.graph.outNeighbors(v).forEach(n=>{ if(!p.includes(n)) q.push([...p,n]); });
+      if((p.length-1)>=maxHops) continue;
+      this.graph.outNeighbors(v).forEach(n=>{
+        if(p.includes(n)) return;
+        const k=this.graph.edge(v,n); if(!k) return; // closed or no edge
+        const a=this.graph.getEdgeAttributes(k); if(this.closedWays.has(a.wayId)) return;
+        q.push([...p,n]);
+      });
     }
+    // convert to edges
     return paths.map(p=>{ const edges=[]; for(let i=0;i<p.length-1;i++){ const k=this.graph.edge(p[i],p[i+1]); if(k) edges.push(k); } return edges; }).filter(e=>e.length);
   }
 
-  animateAlternatives(closedWayId){
-    const w=this.ways[closedWayId], s=w.nodeIds[0], t=w.nodeIds[w.nodeIds.length-1];
-    const alts=this.findAlternatives(s,t,3); const highlighted=new Set();
-    alts.forEach((es,i)=>{
-      es.forEach(k=>{
-        const a=this.graph.getEdgeAttributes(k); const wid=a.wayId; if(!wid||this.closedWays.has(wid)||highlighted.has(wid)) return;
-        highlighted.add(wid); const layer=this.layers[wid]; if(!layer) return;
-        setTimeout(()=>layer.setStyle({color:'#FF6B6B',weight:5,opacity:.95}), i*150);
-        setTimeout(()=>{ if(!this.closedWays.has(wid)){ // revert per current view
+  // 3) Traffic Redistribution: compute volume, distribute to alternatives, update edge weights and speeds
+  computeClosedVolume(wayId){
+    const w=this.ways[wayId]; if(!w) return 0.5;
+    const t=this.baseTraffic[wayId]||this.traffic[wayId]||{current:30,free:50};
+    const vol = w.lenKm * (t.free/Math.max(5,t.current)); // rough demand units
+    return Math.max(0.2, vol);
+  }
+
+  redistributeTrafficVolume(volume, altPaths){
+    if(!altPaths.length) return;
+    // path costs (inverse of travel-time attracts more)
+    const eps=1e-3, pathCost=[], invs=[];
+    altPaths.forEach(edges=>{
+      let cost=0; edges.forEach(k=>{
+        const a=this.graph.getEdgeAttributes(k);
+        const t=this.traffic[a.wayId]||this.baseTraffic[a.wayId]||{current:40,free:50};
+        const speed=Math.max(5,t.current); cost += (a.lenKm/ speed);
+      }); pathCost.push(cost); invs.push(1/Math.max(eps,cost));
+    });
+    const invSum=invs.reduce((s,x)=>s+x,0)||1;
+
+    // distribute volume across paths then across edges by length share; update edge weights and speeds
+    const addedPerWay={};
+    altPaths.forEach((edges,idx)=>{
+      const pathShare=(invs[idx]/invSum);
+      const pathVol=volume*pathShare;
+      let totalLen=edges.reduce((s,k)=>s+(this.graph.getEdgeAttribute(k,'lenKm')||0.05),0.05);
+      edges.forEach(k=>{
+        const a=this.graph.getEdgeAttributes(k);
+        const edgeShare=(a.lenKm||0.05)/totalLen;
+        const edgeVol=pathVol*edgeShare;
+        // bump edge weight
+        const baseW=this.graph.getEdgeAttribute(k,'weight')||1;
+        this.graph.setEdgeAttribute(k,'weight', baseW + edgeVol);
+        // accumulate per-way pressure
+        addedPerWay[a.wayId]=(addedPerWay[a.wayId]||0)+edgeVol;
+      });
+    });
+
+    // adjust speeds for impacted ways (simple slowdown)
+    Object.entries(addedPerWay).forEach(([wid,press])=>{
+      const t=this.traffic[wid]; if(!t) return;
+      const factor=1/(1+0.25*press);
+      t.current=Math.max(5,Math.round(t.current*factor));
+    });
+  }
+
+  // 4) Visual animations for alternatives
+  animateAlternatives(altPaths){
+    const seenWays=new Set();
+    altPaths.forEach((edges,i)=>{
+      edges.forEach(k=>{
+        const a=this.graph.getEdgeAttributes(k); const wid=a.wayId; if(!wid||this.closedWays.has(wid)||seenWays.has(wid)) return;
+        seenWays.add(wid); const layer=this.layers[wid]; if(!layer) return;
+        layer.setStyle({color:'#E11D48',weight:5,opacity:.98}); layer.bringToFront();
+        const el=layer.getElement?.(); if(el) el.classList.add('altPulse');
+        setTimeout(()=>{ // revert style after pulse
+          if(this.closedWays.has(wid)) return;
           if(this.viewMode==='traffic' && this.traffic[wid]){
             const t=this.traffic[wid]; const r=Math.max(0.01,t.current/Math.max(1,t.free));
-            layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.9});
+            layer.setStyle({color:this.congestionColor(r),weight:4,opacity:.95});
           } else if(this.viewMode==='importance' && this.importance[wid]!=null){
-            const s=this.importance[wid]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.9});
+            const s=this.importance[wid]; layer.setStyle({color:this.importanceColor(s),weight:3+(s/25),opacity:.95});
           } else {
-            const ww=this.ways[wid]; layer.setStyle({color:this.roadColor(ww.highway),weight:this.roadWeight(ww.highway),opacity:.75});
+            const w=this.ways[wid]; layer.setStyle({color:this.roadColor(w.highway),weight:this.roadWeight(w.highway),opacity:.85});
           }
-        }}, 2500+i*150);
+          const el2=layer.getElement?.(); if(el2) el2.classList.remove('altPulse');
+        }, 2800 + i*120);
       });
     });
   }
+
+  wayEndpoints(wid){ const w=this.ways[wid]; return {s:w.nodeIds[0], t:w.nodeIds[w.nodeIds.length-1]}; }
 
   resetClosures(){
     Array.from(this.closedWays).forEach(wid=>this.reopenWay(wid));
     this.closedWays.clear();
     this.graph=this.originalGraph.copy();
-    this.recalcTrafficAfterClosures(true);
+    this.recomputeNetworkLoadFromClosures(true);
     this.status('✅ All closures reset.');
   }
 
@@ -470,20 +500,19 @@ class TrafficAnalyzer {
     if(this.drawn) this.drawn.clearLayers();
     Object.values(this.layers).forEach(l=>this.map.removeLayer(l)); this.layers={};
     this.resetState(false);
-    this.status('Cleared. Draw a polygon or load current map bounds.');
+    this.status('Cleared. Draw a polygon or load current bounds.');
   }
 
   resetState(disableButtons){
-    this.nodesById={}; this.ways={}; this.edgesByWay={};
-    this.baseTraffic={}; this.traffic={}; this.importance={};
-    this.closedWays.clear();
-    this.graph.clear(); this.originalGraph=null;
-    this.viewMode='roadtype'; Q('#selView').value='roadtype';
+    this.nodesById={}; this.ways={}; this.edgesByWay={}; this.layers={};
+    this.baseTraffic={}; this.traffic={}; this.importance={}; this.closedWays.clear();
+    this.graph.clear(); this.originalGraph=null; this.viewMode='roadtype'; this.currentPeriod='';
+    Q('#selView').value='roadtype'; Q('#selPeriod').value='';
     ['#selPeriod','#btnImportance','#selView','#btnReset','#btnCloseMode'].forEach(s=>Q(s).disabled=disableButtons);
     Q('#stats').style.display='none';
   }
 
-  // Utilities
+  // Utils
   popupHTML(w,extra=''){ return `<div class="street-popup"><strong>${esc(w.name)}</strong><br>Type: ${esc(w.highway)}<br>Max Speed: ${esc(w.maxspeed)}<br>Way ID: ${w.wayId}${extra}</div>`; }
   lengthKm(coords){ let d=0; for(let i=0;i<coords.length-1;i++) d+=this.haversine(coords[i],coords[i+1]); return d; }
   haversine(a,b){ const R=6371, toRad=x=>x*Math.PI/180, dLat=toRad(b[0]-a[0]), dLon=toRad(b[1]-a[1]); const s1=Math.sin(dLat/2), s2=Math.sin(dLon/2); const q=s1*s1+Math.cos(toRad(a[0]))*Math.cos(toRad(b[0]))*s2*s2; return 2*R*Math.asin(Math.sqrt(q)); }
