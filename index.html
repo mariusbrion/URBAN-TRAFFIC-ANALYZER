@@ -218,7 +218,8 @@
         
         <div style="margin-top: 15px; padding: 10px; background: #FFF3CD; border-radius: 4px; font-size: 12px;">
             <strong>🚧 Simulation Mode:</strong>
-            <div style="margin-top: 5px;">Click streets to close/open them</div>
+            <div style="margin-top: 5px;">Click a street to select it</div>
+            <button id="closeSelectedBtn" class="btn" style="background: #000; margin-top: 8px; padding: 8px;" disabled>Close Selected Street</button>
         </div>
         
         <button id="resetSimulationBtn" class="btn" style="background: #FF9800; margin-top: 10px;" disabled>Reset Closures</button>
@@ -278,6 +279,7 @@
                 this.importanceScores = {};
                 this.closedStreets = new Set();
                 this.originalGraph = null;
+                this.selectedStreet = null;
                 
                 // Default city: Bordeaux, France
                 this.defaultCenter = [44.8378, -0.5792];
@@ -379,6 +381,12 @@
                 document.getElementById('resetSimulationBtn').addEventListener('click', () => {
                     this.resetSimulation();
                 });
+                
+                document.getElementById('closeSelectedBtn').addEventListener('click', () => {
+                    if (this.selectedStreet) {
+                        this.simulateStreetClosure(this.selectedStreet);
+                    }
+                });
             }
             
             clearAll() {
@@ -458,6 +466,7 @@
                     document.getElementById('calculateImportanceBtn').disabled = false;
                     document.getElementById('viewModeSelect').disabled = false;
                     document.getElementById('resetSimulationBtn').disabled = false;
+                    // Note: closeSelectedBtn stays disabled until street is selected
                     
                     // Save original graph for simulation resets
                     this.originalGraph = this.graph.copy();
@@ -948,25 +957,51 @@
                 document.querySelector('.legend-item:nth-child(6) .legend-color').style.background = '#60A5FA';
             }
             
-            updateStreetPopup(layer, attributes) {
-                const edgeId = attributes.edgeId;
-                const isClosed = this.closedStreets.has(edgeId);
-                const buttonText = isClosed ? '✅ Reopen Street' : '🚧 Close Street';
-                const buttonClass = isClosed ? 'close-btn reopen' : 'close-btn';
+            selectStreet(edgeId) {
+                // Deselect previous
+                if (this.selectedStreet && this.streetLayers[this.selectedStreet]) {
+                    const prevLayer = this.streetLayers[this.selectedStreet];
+                    if (!this.closedStreets.has(this.selectedStreet)) {
+                        // Restore original style
+                        this.graph.forEachEdge((edge, attrs) => {
+                            if (attrs.edgeId === this.selectedStreet) {
+                                const color = this.currentViewMode === 'importance' 
+                                    ? this.getImportanceColor(this.importanceScores[this.selectedStreet] || 0)
+                                    : this.currentViewMode === 'traffic' && attrs.traffic
+                                    ? this.calculateCongestion(attrs.traffic).color
+                                    : this.getRoadColor(attrs.highway);
+                                prevLayer.setStyle({ color, weight: 3, opacity: 0.7 });
+                            }
+                        });
+                    }
+                }
                 
-                const popupContent = `
-                    <div class="street-popup">
-                        <strong>${attributes.name}</strong><br>
-                        Type: ${attributes.highway}<br>
-                        Max Speed: ${attributes.maxspeed}<br>
-                        Way ID: ${attributes.wayId}
-                        <button class="${buttonClass}" onclick="window.analyzer.simulateStreetClosure('${edgeId}'); return false;">
-                            ${buttonText}
-                        </button>
-                    </div>
-                `;
+                // Select new street
+                this.selectedStreet = edgeId;
+                const layer = this.streetLayers[edgeId];
                 
-                layer.bindPopup(popupContent);
+                if (this.closedStreets.has(edgeId)) {
+                    // Already closed - highlight for reopening
+                    layer.setStyle({ 
+                        color: '#4CAF50',
+                        weight: 6,
+                        opacity: 0.9
+                    });
+                    document.getElementById('closeSelectedBtn').textContent = '✅ Reopen Selected Street';
+                    document.getElementById('closeSelectedBtn').style.background = '#4CAF50';
+                } else {
+                    // Highlight for closing
+                    layer.setStyle({ 
+                        color: '#FFD700',
+                        weight: 6,
+                        opacity: 0.9
+                    });
+                    document.getElementById('closeSelectedBtn').textContent = '🚧 Close Selected Street';
+                    document.getElementById('closeSelectedBtn').style.background = '#000';
+                }
+                
+                document.getElementById('closeSelectedBtn').disabled = false;
+                this.updateStatus(`Street selected: Click "Close Selected Street" button to close/reopen`);
             }
             
             simulateStreetClosure(edgeId) {
@@ -994,8 +1029,11 @@
                     });
                     
                     this.updatePopupButton(edgeId, false);
-                    this.updatePopupButton(edgeId, false);
                     this.updateStatus(`Street reopened. ${this.closedStreets.size} streets closed.`);
+                    
+                    // Clear selection
+                    this.selectedStreet = null;
+                    document.getElementById('closeSelectedBtn').disabled = true;
                 } else {
                     // Close street
                     this.closedStreets.add(edgeId);
@@ -1036,38 +1074,11 @@
                     }
                     
                     this.updatePopupButton(edgeId, true);
-                    this.updatePopupButton(edgeId, true);
                     this.updateStatus(`🚧 Street closed! ${this.closedStreets.size} total closures. Finding alternatives...`);
-                }
-                
-                // Close and reopen popup to refresh
-                layer.closePopup();
-                setTimeout(() => layer.openPopup(), 100);
-            }
-            
-            updatePopupButton(edgeId, isClosed) {
-                const layer = this.streetLayers[edgeId];
-                if (!layer) return;
-                
-                // Get attributes from graph
-                let attributes = null;
-                this.graph.forEachEdge((edge, attrs) => {
-                    if (attrs.edgeId === edgeId) {
-                        attributes = attrs;
-                    }
-                });
-                
-                // If not in graph (closed), get from original graph
-                if (!attributes && this.originalGraph) {
-                    this.originalGraph.forEachEdge((edge, attrs) => {
-                        if (attrs.edgeId === edgeId) {
-                            attributes = attrs;
-                        }
-                    });
-                }
-                
-                if (attributes) {
-                    this.updateStreetPopup(layer, attributes);
+                    
+                    // Clear selection
+                    this.selectedStreet = null;
+                    document.getElementById('closeSelectedBtn').disabled = true;
                 }
             }
             
@@ -1175,11 +1186,17 @@
                 });
                 
                 this.closedStreets.clear();
+                this.selectedStreet = null;
                 
                 // Restore original graph
                 if (this.originalGraph) {
                     this.graph = this.originalGraph.copy();
                 }
+                
+                // Disable and reset button
+                document.getElementById('closeSelectedBtn').disabled = true;
+                document.getElementById('closeSelectedBtn').textContent = '🚧 Close Selected Street';
+                document.getElementById('closeSelectedBtn').style.background = '#000';
                 
                 // Refresh visualization
                 this.toggleViewMode(this.currentViewMode);
