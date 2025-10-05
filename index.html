@@ -26,6 +26,16 @@
   @keyframes flash{0%,100%{opacity:.55}50%{opacity:1}}
   .altPulse{animation:pulse 1.8s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
+
+  /* Flow animation on alternate routes */
+  .leaflet-interactive.flow {
+    stroke-dasharray: 18 10;
+    animation: flow 2.2s linear infinite;
+  }
+  @keyframes flow {
+    0% { stroke-dashoffset: 150; }
+    100% { stroke-dashoffset: 0; }
+  }
 </style>
 </head>
 <body>
@@ -130,12 +140,15 @@ class TrafficAnalyzer {
   congestionColor(r){ return r>0.8?'#22C55E':r>0.6?'#FACC15':r>0.4?'#FB923C':r>0.2?'#EF4444':'#991B1B'; }
   importanceColor(s){ return s>80?'#DC2626':s>60?'#F97316':s>40?'#FACC15':s>20?'#4ADE80':'#60A5FA'; }
   rank(s){ return s>80?'Critical':s>60?'Very Important':s>40?'Important':s>20?'Moderate':'Low'; }
-  ensureClass(layer, cls, add=true, tries=10){
-    const apply=()=>{
-      const el = layer.getElement && layer.getElement();
-      if(!el){ if(tries>0) requestAnimationFrame(()=>this.ensureClass(layer,cls,add,tries-1)); return; }
-      add ? el.classList.add(cls) : el.classList.remove(cls);
-    }; apply();
+
+  // Attach/remove CSS class on the SVG path of a Leaflet polyline
+  applyClass(layer, cls, add=true, tries=10){
+    const el = layer && (layer._path || (layer.getElement && layer.getElement && layer.getElement()));
+    if (!el){
+      if (tries>0) requestAnimationFrame(()=>this.applyClass(layer, cls, add, tries-1));
+      return;
+    }
+    add ? el.classList.add(cls) : el.classList.remove(cls);
   }
 
   async loadOSM(){
@@ -165,7 +178,12 @@ class TrafficAnalyzer {
       });
       if(!Object.keys(this.ways).length){ this.status('No streets found.'); Q('#btnLoad').disabled=false; return; }
 
-      this.buildCompressedGraph(); this.drawWays();
+      this.buildCompressedGraph(); 
+      this.drawWays();
+
+      // Seed baseline traffic so simulation works even without TomTom
+      this.seedTrafficFromOSM();
+
       this.originalGraph=this.graph.copy();
       Q('#stats').style.display='block';
       Q('#nodes').textContent=`Nodes: ${this.graph.order}`;
@@ -215,6 +233,55 @@ class TrafficAnalyzer {
     this.updateLegendRoad();
   }
 
+  // Traffic seeding and helpers
+  parseMaxspeed(tag){
+    if (!tag) return null;
+    if (typeof tag === 'number') return Math.round(tag);
+    if (typeof tag !== 'string') return null;
+    const mph = tag.match(/(\d+(?:\.\d+)?)\s*mph/i);
+    if (mph) return Math.round(parseFloat(mph[1]) * 1.60934);
+    const kmh = tag.match(/(\d+(?:\.\d+)?)/);
+    if (kmh) return Math.round(parseFloat(kmh[1]));
+    return null;
+  }
+  getDefaultFreeSpeed(highway, maxspeedTag){
+    const parsed = this.parseMaxspeed(maxspeedTag);
+    if (parsed) return parsed;
+    const map = {
+      motorway:110, motorway_link:90,
+      trunk:100, trunk_link:80,
+      primary:80, primary_link:70,
+      secondary:65, secondary_link:60,
+      tertiary:55,
+      residential:35, living_street:15,
+      unclassified:45, service:25
+    };
+    return map[highway] || 50;
+  }
+  seedTrafficFromOSM(){
+    this.baseTraffic = {};
+    this.traffic = {};
+    Object.entries(this.ways).forEach(([wid, w])=>{
+      const free = this.getDefaultFreeSpeed(w.highway, w.maxspeed);
+      const obj = {current: free, free: free, confidence: 0.3};
+      this.baseTraffic[wid] = {...obj};
+      this.traffic[wid] = {...obj};
+    });
+  }
+  ensureTrafficForWay(wayId){
+    if (this.traffic[wayId]) return this.traffic[wayId];
+    const w = this.ways[wayId];
+    if (!w) return null;
+    const free = this.getDefaultFreeSpeed(w.highway, w.maxspeed);
+    const obj = {current: free, free: free, confidence: 0.3};
+    this.baseTraffic[wayId] = this.baseTraffic[wayId] || {...obj};
+    this.traffic[wayId] = {...obj};
+    return this.traffic[wayId];
+  }
+  hasTraffic(){
+    return Object.keys(this.traffic||{}).length>0 || Object.keys(this.baseTraffic||{}).length>0;
+  }
+
   async loadTraffic(period){
     this.status(`Loading ${period} traffic (snapshot)…`,true);
     this.baseTraffic={}; this.traffic={}; this.currentPeriod=period;
@@ -241,8 +308,10 @@ class TrafficAnalyzer {
     const factor = period==='morning'?0.75: period==='evening'?0.7: 1.05;
     const fresh={};
     Object.keys(this.ways).forEach(wid=>{
-      const b=this.baseTraffic[wid]; if(!b) return;
-      fresh[wid]={current:Math.max(5, Math.round(b.current*factor)), free:b.free, confidence:b.confidence};
+      const b=this.baseTraffic[wid]; 
+      if(b){
+        fresh[wid]={current:Math.max(5, Math.round(b.current*factor)), free:b.free, confidence:b.confidence};
+      }
     });
     this.traffic=fresh;
     this.recomputeNetworkLoadFromClosures(true);
@@ -254,10 +323,10 @@ class TrafficAnalyzer {
       if(!w||!layer) continue;
       if(t){
         const ratio=Math.max(0.01, t.current/Math.max(1,t.free));
-        layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.95});
+        layer.setStyle({color:this.congestionColor(ratio),weight:4,opacity:.95, dashArray: null});
         layer.setPopupContent(this.popupHTML(w, `<br><strong>Traffic</strong><br>Current: ${t.current} km/h<br>Free: ${t.free} km/h<br>Congestion: ${Math.round((1-ratio)*100)}%`));
       } else {
-        layer.setStyle({color:'#bbb',weight:3,opacity:.6});
+        layer.setStyle({color:'#bbb',weight:3,opacity:.6, dashArray: null});
       }
     }
   }
@@ -297,7 +366,7 @@ class TrafficAnalyzer {
     Object.entries(this.layers).forEach(([wid,layer])=>{
       const score=this.importance[wid]||0, w=this.ways[wid];
       const opacity=0.5 + 0.5*(score/100);
-      layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity});
+      layer.setStyle({color:this.importanceColor(score),weight:3+(score/25),opacity, dashArray: null});
       layer.setPopupContent(this.popupHTML(w, `<br><strong>Importance</strong><br>Score: ${score}/100 (${this.rank(score)})`));
     });
   }
@@ -325,7 +394,7 @@ class TrafficAnalyzer {
     this.viewMode=mode;
     if(mode==='roadtype'){ this.drawWays(); this.updateLegendRoad(); }
     else if(mode==='traffic'){
-      if(Object.keys(this.baseTraffic).length){ this.renderTraffic(); this.updateLegendTraffic(); }
+      if(Object.keys(this.baseTraffic).length || Object.keys(this.traffic).length){ this.renderTraffic(); this.updateLegendTraffic(); }
       else { alert('Load traffic data first'); Q('#selView').value='roadtype'; this.viewMode='roadtype'; this.updateLegendRoad(); }
     } else if(mode==='importance'){
       if(Object.keys(this.importance).length){ this.renderImportance(); this.updateLegendImportance(); }
@@ -351,19 +420,25 @@ class TrafficAnalyzer {
     const layer=this.layers[wayId]; if(!layer) return;
     this.closedWays.add(wayId);
     layer.setStyle({color:'#000',opacity:.95,weight:6,dashArray:'10,8'}); layer.bringToFront();
-    this.ensureClass(layer,'closed',true);
+    this.applyClass(layer,'closed',true);
 
     // remove edges for this way
     (this.edgesByWay[wayId]||[]).forEach(k=>{ if(this.graph.hasEdge(k)) this.graph.dropEdge(k); });
 
-    // volume and alternatives (directed BFS, max 3 paths, max 10 hops)
+    // estimate volume and alternatives
     const volume=this.computeClosedVolume(wayId);
     const {s,t}=this.getConnectorEndpoints(wayId);
-    const alts=this.findAlternatives(s,t,3,10);
+    const alts=this.findAlternatives(s,t,3);
 
-    // redistribute and animate
-    this.redistributeTrafficVolume(volume, alts);
-    this.animateAlternatives(alts);
+    if (alts.length){
+      this.redistributeTrafficVolume(volume, alts);
+      this.animateAlternatives(alts);
+    } else {
+      console.info('No alternative path found for closure', wayId);
+    }
+
+    if (!this.hasTraffic()) this.seedTrafficFromOSM();
+    if (this.viewMode!=='traffic') { this.viewMode='traffic'; Q('#selView').value='traffic'; this.renderTraffic(); this.updateLegendTraffic(); }
 
     if(this.viewMode==='traffic') this.renderTraffic();
     this.status(`🚧 Closed: ${this.ways[wayId]?.name || wayId}. Total closures: ${this.closedWays.size}.`);
@@ -383,8 +458,9 @@ class TrafficAnalyzer {
 
     // Visual reset according to current view
     this.updateStreetStyle(wayId);
-    this.ensureClass(layer,'closed',false);
-    this.ensureClass(layer,'altPulse',false);
+    this.applyClass(layer,'closed',false);
+    this.applyClass(layer,'altPulse',false);
+    this.applyClass(layer,'flow',false);
 
     // Recompute loads based on remaining closures
     this.recomputeNetworkLoadFromClosures(true);
@@ -396,7 +472,10 @@ class TrafficAnalyzer {
     // reset edge weights
     this.graph.forEachEdge((k)=>this.graph.setEdgeAttribute(k,'weight',1));
 
-    // reset traffic to current period/base
+    // guarantee baseline traffic
+    if (!this.hasTraffic()) this.seedTrafficFromOSM();
+
+    // start from current snapshot if present, else base
     const base = Object.keys(this.traffic).length ? this.traffic : this.baseTraffic;
     const fresh={}; Object.keys(base).forEach(wid=>fresh[wid]={...base[wid]});
     this.traffic=fresh;
@@ -405,55 +484,90 @@ class TrafficAnalyzer {
     this.closedWays.forEach(wid=>{
       const vol=this.computeClosedVolume(wid);
       const {s,t}=this.getConnectorEndpoints(wid);
-      const alts=this.findAlternatives(s,t,3,10);
+      const alts=this.findAlternatives(s,t,3);
       this.redistributeTrafficVolume(vol, alts);
     });
 
     if(repaint && this.viewMode==='traffic') this.renderTraffic();
   }
 
-  // Alternative routes: directed BFS with cost-priority, avoid closed, limit hops
-  findAlternatives(source, target, maxPaths = 3, maxHops = 10) {
-    const res = [];
-    if (!source || !target || !this.graph.hasNode(source) || !this.graph.hasNode(target)) return res;
+  // Weighted Dijkstra to get k alternative paths (penalize previously used edges)
+  shortestPathDijkstra(src, dst, penalty={}, maxExpands=8000){
+    if (!src || !dst || !this.graph.hasNode(src) || !this.graph.hasNode(dst)) return null;
+    const dist = Object.create(null);
+    const prev = Object.create(null);
+    const visited = new Set();
 
-    const queue = [{ path: [source], cost: 0 }];
-    const visited = new Set([source]);
+    const queue = [];
+    const push = (item)=>{ queue.push(item); queue.sort((a,b)=>a.cost-b.cost); };
 
-    while (queue.length > 0 && res.length < maxPaths) {
-      queue.sort((a, b) => a.cost - b.cost); // prioritize shorter-cost paths
-      const { path, cost } = queue.shift();
-      const current = path[path.length - 1];
+    dist[src] = 0;
+    push({node: src, cost: 0});
 
-      if (current === target) {
-        if (path.length > 1) res.push(path);
-        continue;
-      }
-      if (path.length > maxHops) continue;
+    let expands = 0;
+    while(queue.length){
+      if (++expands > maxExpands) break;
+      const {node: u, cost: d} = queue.shift();
+      if (visited.has(u)) continue;
+      visited.add(u);
 
-      const neighbors = this.graph.outNeighbors(current) || [];
-      for (const neighbor of neighbors) {
-        if (visited.has(neighbor) || path.includes(neighbor)) continue;
+      if (u === dst) break;
 
-        const edgeKey = this.graph.edge(current, neighbor);
-        if (!edgeKey) continue;
-        const edgeData = this.graph.getEdgeAttributes(edgeKey);
-        if (!edgeData || this.closedWays.has(edgeData.wayId)) continue;
+      const neigh = this.graph.outNeighbors(u) || [];
+      for (const v of neigh){
+        const ek = this.graph.directedEdge(u, v);
+        if (!ek) continue;
+        const attrs = this.graph.getEdgeAttributes(ek);
+        if (!attrs || this.closedWays.has(attrs.wayId)) continue;
 
-        visited.add(neighbor);
-        const newCost = cost + (edgeData.lenKm || 0.1);
-        queue.push({ path: [...path, neighbor], cost: newCost });
+        const t = this.traffic[attrs.wayId] || this.baseTraffic[attrs.wayId] || this.ensureTrafficForWay(attrs.wayId);
+        const speed = Math.max(5, t?.current || this.getDefaultFreeSpeed(attrs.highway));
+        const lenKm = attrs.lenKm || 0.1;
+        let edgeCost = lenKm / speed; // hours-ish
+        if (penalty && penalty[ek]) edgeCost *= (1 + 0.35*penalty[ek]);
+
+        const alt = d + edgeCost;
+        if (dist[v]===undefined || alt < dist[v]){
+          dist[v] = alt;
+          prev[v] = {node: u, edge: ek};
+          push({node: v, cost: alt});
+        }
       }
     }
 
-    return res.map(path => {
-      const edges = [];
-      for (let i = 0; i < path.length - 1; i++) {
-        const edgeKey = this.graph.edge(path[i], path[i+1]);
-        if (edgeKey) edges.push(edgeKey);
-      }
-      return edges;
-    }).filter(edges => edges.length > 0);
+    if (src!==dst && !prev[dst]) return null;
+
+    const pathNodes = [];
+    let cur = dst;
+    pathNodes.unshift(cur);
+    while(cur !== src){
+      const p = prev[cur];
+      if (!p) return null;
+      cur = p.node;
+      pathNodes.unshift(cur);
+    }
+    return pathNodes;
+  }
+  edgesFromNodePath(nodes){
+    const edges=[];
+    for (let i=0;i<nodes.length-1;i++){
+      const ek = this.graph.directedEdge(nodes[i], nodes[i+1]);
+      if (!ek) return null;
+      edges.push(ek);
+    }
+    return edges;
+  }
+  findAlternatives(source, target, maxPaths=3){
+    const res=[]; const penalty = Object.create(null);
+    for (let i=0;i<maxPaths;i++){
+      const nodesPath = this.shortestPathDijkstra(source, target, penalty);
+      if (!nodesPath) break;
+      const edges = this.edgesFromNodePath(nodesPath);
+      if (!edges || !edges.length) break;
+      res.push(edges);
+      edges.forEach(k => penalty[k] = (penalty[k] || 0) + 1); // discourage reusing same edges
+    }
+    return res;
   }
 
   // Use nodes that still connect to network post-closure
@@ -483,18 +597,19 @@ class TrafficAnalyzer {
   redistributeTrafficVolume(volume, altPaths) {
     if (!altPaths.length) return;
 
+    // cost per path using current speeds (or defaults)
     const pathCosts = altPaths.map(edges => {
       let cost = 0;
       edges.forEach(edgeKey => {
         const edgeData = this.graph.getEdgeAttributes(edgeKey);
-        const t = this.traffic[edgeData.wayId] || this.baseTraffic[edgeData.wayId];
+        const t = this.traffic[edgeData.wayId] || this.baseTraffic[edgeData.wayId] || this.ensureTrafficForWay(edgeData.wayId);
         const speed = Math.max(5, t?.current || 30);
         cost += (edgeData.lenKm || 0.1) / speed;
       });
       return cost;
     });
 
-    const totalInverseCost = pathCosts.reduce((sum, cost) => sum + (1 / Math.max(0.1, cost)), 0);
+    const totalInverseCost = pathCosts.reduce((sum, c) => sum + (1 / Math.max(0.1, c)), 0);
     const addedPerWay = {};
 
     altPaths.forEach((edges, idx) => {
@@ -511,28 +626,38 @@ class TrafficAnalyzer {
         this.graph.setEdgeAttribute(edgeKey, 'weight', currentWeight + edgeVolume);
 
         addedPerWay[edgeData.wayId] = (addedPerWay[edgeData.wayId] || 0) + edgeVolume;
+
+        // ensure traffic object exists to be updated
+        this.ensureTrafficForWay(edgeData.wayId);
       });
     });
 
+    // Slow down routes based on added volume
     Object.entries(addedPerWay).forEach(([wayId, addedVolume]) => {
-      if (!this.traffic[wayId]) return;
+      const t = this.ensureTrafficForWay(wayId);
       const congestionFactor = 1 / (1 + addedVolume * 0.1);
-      this.traffic[wayId].current = Math.max(5, Math.round(this.traffic[wayId].current * congestionFactor));
+      t.current = Math.max(5, Math.round(t.current * congestionFactor));
     });
   }
 
-  // Pulse red alternatives and then revert per current view
+  // Flow animation for alternatives then revert per current view
   animateAlternatives(altPaths){
     const seenWays=new Set();
+    const colors = ['#22c55e','#84cc16','#06b6d4'];
     altPaths.forEach((edges,i)=>{
       edges.forEach(k=>{
         const a=this.graph.getEdgeAttributes(k); const wid=a?.wayId;
         if(!wid || this.closedWays.has(wid) || seenWays.has(wid)) return;
         seenWays.add(wid);
         const layer=this.layers[wid]; if(!layer) return;
-        layer.setStyle({color:'#E11D48',weight:5,opacity:.98}); layer.bringToFront();
-        this.ensureClass(layer,'altPulse',true);
-        setTimeout(()=>{ if(this.closedWays.has(wid)) return; this.updateStreetStyle(wid); this.ensureClass(layer,'altPulse',false); }, 2800 + i*120);
+        layer.setStyle({color: colors[i] || '#22c55e', weight: 6, opacity: 1});
+        layer.bringToFront();
+        this.applyClass(layer, 'flow', true);
+        setTimeout(()=>{ 
+          if(this.closedWays.has(wid)) return; 
+          this.applyClass(layer,'flow',false); 
+          this.updateStreetStyle(wid);
+        }, 3500 + i*300);
       });
     });
   }
